@@ -695,6 +695,15 @@ impl CaptureManager {
             .stdin(Stdio::null())
             .kill_on_drop(true);
 
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                // Set evdi_helper to nice +1 to prioritize GNOME Mutter compositor
+                libc::setpriority(libc::PRIO_PROCESS, 0, 1);
+                Ok(())
+            });
+        }
+
         let mut child = cmd.spawn().context("Failed to spawn evdi-helper")?;
 
         let stdout = child
@@ -864,12 +873,9 @@ impl CaptureManager {
         ]);
 
         if encoder == "h264_vaapi" || encoder == "hevc_vaapi" {
-            let vf = if ten_bit && encoder == "hevc_vaapi" {
-                "format=p010le,hwupload"
-            } else {
-                "format=nv12,hwupload"
-            };
-            encoder_args.extend_from_slice(&["-vf".into(), vf.into()]);
+            // For VAAPI hardware encode, directly upload the 8-bit NV12 frames from the capture FIFO.
+            // Avoid software CPU conversion to p010le which burns 240% CPU and starves the compositor.
+            encoder_args.extend_from_slice(&["-vf".into(), "format=nv12,hwupload".into()]);
         } else if ten_bit {
             // The FIFO carries 8-bit NV12, so 10-bit encoding needs a conversion
             // first. Done here rather than in the helper to keep the FIFO format
@@ -952,10 +958,11 @@ impl CaptureManager {
                 "-idr_interval".into(),
                 "1".into(),
             ]);
-            if ten_bit && encoder == "hevc_vaapi" {
+            if encoder == "hevc_vaapi" {
+                // Main profile uses direct 8-bit NV12 hardware encoding on Intel Arc
                 encoder_args.extend_from_slice(&[
                     "-profile:v".into(),
-                    "main10".into(),
+                    "main".into(),
                 ]);
             }
         } else if encoder == "libx264" {
@@ -995,6 +1002,15 @@ impl CaptureManager {
             .stderr(Stdio::inherit())
             .stdin(Stdio::null())
             .kill_on_drop(true);
+
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                // Lower FFmpeg CPU priority (nice +5) so Mutter and desktop presentation are never starved
+                libc::setpriority(libc::PRIO_PROCESS, 0, 5);
+                Ok(())
+            });
+        }
 
         cmd.spawn().context("Failed to spawn ffmpeg encoder")
     }

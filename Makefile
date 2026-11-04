@@ -13,6 +13,10 @@ all: build
 # Generic -O3 (no -march=native): release binaries must run on any x86-64 CPU
 build-helper:
 	$(CC) -O3 -o host/evdi/evdi_helper host/evdi/evdi_helper.c /lib/libevdi.so.1 -lpthread -lX11 -lXrandr -Ihost/evdi
+	mkdir -p target/release target/debug $(BIN_DIR)
+	rm -f target/release/evdi_helper $(BIN_DIR)/evdi_helper
+	cp host/evdi/evdi_helper target/release/evdi_helper
+	cp host/evdi/evdi_helper $(BIN_DIR)/evdi_helper
 	@echo "✓ EVDI helper: host/evdi/evdi_helper"
 
 build: build-helper

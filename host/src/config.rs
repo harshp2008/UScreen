@@ -145,6 +145,9 @@ pub struct FileConfig {
     pub input_port: u16,
     /// Launch the UScreen app on the tablet automatically when it's plugged in
     pub auto_launch_app: bool,
+    /// When enabled and system power profile is "performance", forces 60 FPS stream
+    /// even when cursor is on the primary display.
+    pub max_performance_mode: bool,
 }
 
 impl Default for FileConfig {
@@ -171,6 +174,7 @@ impl Default for FileConfig {
             video_port: 8890,
             input_port: 8891,
             auto_launch_app: true,
+            max_performance_mode: false,
         }
     }
 }

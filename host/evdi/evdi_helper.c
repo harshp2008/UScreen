@@ -98,8 +98,10 @@ static volatile int g_buffers_ready = 0;
    encoder rather than a pipe into the ffmpeg CLI. */
 /* At 33ms (~30fps) the idle floor keeps the encoder and the client's read
    timeout smoothly paced without freezing, while identical frames consume
-   negligible bitrate in hardware encoders via skip macroblocks. */
-#define IDLE_KEEPALIVE_MS 33
+   negligible bitrate in hardware encoders via skip macroblocks.
+   In Max Performance Mode, this is lowered to 16ms (approx 60 FPS). */
+#define DEFAULT_IDLE_KEEPALIVE_MS 33
+static int g_idle_keepalive_ms = DEFAULT_IDLE_KEEPALIVE_MS;
 static long long g_last_write_ms = 0;
 
 static long long now_us(void);
@@ -961,7 +963,7 @@ static void *writer_thread(void *arg) {
            transmit no new information. The occasional keepalive keeps the
            encoder and the client's read timeout alive. */
         long long now_ms_write = now_ms();
-        if (!fresh && (now_ms_write - g_last_write_ms) < IDLE_KEEPALIVE_MS)
+        if (!fresh && (now_ms_write - g_last_write_ms) < g_idle_keepalive_ms)
             continue;
 
         /* Suppress re-sending stale frames containing a departed cursor during
@@ -1217,6 +1219,9 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
             g_fps = atoi(argv[++i]);
             if (g_fps < 1 || g_fps > 240) g_fps = 60;
+        } else if (strcmp(argv[i], "--max-performance") == 0) {
+            g_idle_keepalive_ms = 16;
+            fprintf(stderr, "[evdi-helper] Max Performance Mode enabled: idle keepalive set to 16ms (~60 FPS)\n");
         }
     }
 

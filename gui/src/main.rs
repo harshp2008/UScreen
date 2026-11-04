@@ -44,6 +44,7 @@ struct FileConfig {
     video_port: u16,
     input_port: u16,
     auto_launch_app: bool,
+    max_performance_mode: bool,
 }
 
 impl Default for FileConfig {
@@ -70,6 +71,7 @@ impl Default for FileConfig {
             video_port: 8890,
             input_port: 8891,
             auto_launch_app: true,
+            max_performance_mode: false,
         }
     }
 }
@@ -833,6 +835,19 @@ impl eframe::App for App {
                                 Err(e) => self.message = e,
                             }
                         }
+                    });
+                    ui.end_row();
+
+                    ui.label("Performance");
+                    ui.vertical(|ui| {
+                        ui.checkbox(
+                            &mut self.cfg.max_performance_mode,
+                            "Max Performance Mode (Force 60FPS on Performance Profile)",
+                        )
+                        .on_hover_text(
+                            "When system power profile is 'performance', eliminates idle FPS \
+                             throttling and forces a continuous 60FPS stream.",
+                        );
                     });
                     ui.end_row();
                 });

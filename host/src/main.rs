@@ -83,6 +83,10 @@ struct Cli {
 
     #[arg(long = "input-port")]
     input_port: Option<u16>,
+
+    /// Force 60 FPS stream on performance power profile
+    #[arg(long = "max-performance")]
+    max_performance: bool,
 }
 
 #[derive(Subcommand)]
@@ -233,6 +237,7 @@ async fn run_daemon(cli: Cli) -> Result<()> {
     let quality = cli.quality.unwrap_or(file_cfg.quality);
     let stream_scale = cli.stream_scale.unwrap_or(file_cfg.stream_scale);
     let pen_only = cli.pen_only || file_cfg.pen_only;
+    let max_performance_mode = cli.max_performance || file_cfg.max_performance_mode;
 
     let cap_config = capture::CaptureConfig {
         helper_path: find_helper(&cli.helper),
@@ -253,6 +258,7 @@ async fn run_daemon(cli: Cli) -> Result<()> {
         // With several tablets every helper is pinned to its own card; the
         // helper's own search would give each of them the same one.
         card: if file_cfg.max_tablets > 1 { vdisplay::evdi_cards().into_iter().min() } else { None },
+        max_performance_mode,
     };
 
     // One secret per daemon run. Handed to the app over adb when it is
@@ -511,6 +517,7 @@ async fn run_daemon(cli: Cli) -> Result<()> {
             ten_bit: file_cfg.ten_bit,
             instance: 0,
             card: None,
+            max_performance_mode,
         },
         video_port,
         input_port,

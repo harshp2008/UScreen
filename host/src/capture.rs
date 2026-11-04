@@ -196,6 +196,8 @@ pub struct CaptureConfig {
     /// EVDI card to pin the helper to. None lets the helper pick a free one,
     /// which is only safe with a single tablet.
     pub card: Option<u32>,
+    /// When true and power profile is "performance", forces 60 FPS keepalive stream.
+    pub max_performance_mode: bool,
 }
 
 impl Default for CaptureConfig {
@@ -216,6 +218,7 @@ impl Default for CaptureConfig {
             ten_bit: false,
             instance: 0,
             card: None,
+            max_performance_mode: false,
         }
     }
 }
@@ -662,6 +665,29 @@ impl CaptureManager {
         cmd.args(["--capture-fifo", &fifo]);
         if let Some(card) = self.config.card {
             cmd.args(["--card", &card.to_string()]);
+        }
+
+        if self.config.max_performance_mode {
+            let profile = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                Command::new("powerprofilesctl").arg("get").output(),
+            )
+            .await;
+            match profile {
+                Ok(Ok(output)) if output.status.success() => {
+                    let current = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    info!("Checked power profile: '{}'", current);
+                    if current == "performance" {
+                        info!("Max Performance Mode active (performance profile detected): appending --max-performance to evdi_helper arguments");
+                        cmd.arg("--max-performance");
+                    } else {
+                        info!("Max Performance Mode configured, but power profile is '{}' (not 'performance') - running standard pacing", current);
+                    }
+                }
+                _ => {
+                    warn!("Failed or timed out querying powerprofilesctl");
+                }
+            }
         }
 
         cmd.stdout(Stdio::piped())

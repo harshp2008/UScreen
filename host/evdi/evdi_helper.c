@@ -18,6 +18,8 @@
    ddcci_data_handler member of evdi_event_context, so a struct one pointer
    too short was being handed to a library that reads that member. */
 #include "evdi_lib.h"
+#include <X11/Xlib.h>
+#include <X11/extensions/Xrandr.h>
 
 static evdi_handle g_handle = EVDI_INVALID_HANDLE;
 static int g_device_index = -1;
@@ -141,6 +143,142 @@ static volatile long long g_last_request_ms = 0;
 static void handle_signal(int sig) {
     (void)sig;
     g_running = 0;
+}
+
+/* --- Dynamic Boundary Synchronization (Zero Ghost Cursor & Zero Boundary Lag) --- */
+static pthread_t g_boundary_thread = 0;
+static volatile int g_boundary_running = 0;
+static Display *g_x11_dpy = NULL;
+static Window g_nudge_win = 0;
+static int g_tablet_x = 1920;
+static int g_tablet_y = 165;
+static int g_tablet_w = 1464;
+static int g_tablet_h = 915;
+static volatile int g_pointer_in_tablet = 0;
+static volatile long long g_last_exit_time_us = 0;
+
+static void *boundary_sync_thread(void *arg) {
+    (void)arg;
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 8000000L }; /* 8ms (125Hz polling) */
+    int toggle = 1;
+    long long last_prewarm = 0;
+
+    while (g_running && g_boundary_running) {
+        nanosleep(&ts, NULL);
+        if (!g_x11_dpy || !g_nudge_win) continue;
+
+        Window root_ret, child_ret;
+        int rx = 0, ry = 0, wx = 0, wy = 0;
+        unsigned int mask = 0;
+        if (!XQueryPointer(g_x11_dpy, DefaultRootWindow(g_x11_dpy),
+                           &root_ret, &child_ret, &rx, &ry, &wx, &wy, &mask)) {
+            continue;
+        }
+
+        int in_tablet = (rx >= g_tablet_x && rx < (g_tablet_x + g_tablet_w) &&
+                         ry >= g_tablet_y && ry < (g_tablet_y + g_tablet_h));
+
+        if (g_pointer_in_tablet && !in_tablet) {
+            /* Mouse exited tablet -> laptop screen: force Mutter to schedule immediate clear frame */
+            g_pointer_in_tablet = 0;
+            g_last_exit_time_us = now_us();
+            toggle = (toggle == 1) ? 2 : 1;
+            XResizeWindow(g_x11_dpy, g_nudge_win, toggle, 1);
+            XFlush(g_x11_dpy);
+            if (g_pipeline) {
+                g_last_request_ms = 0;
+            }
+        } else if (!g_pointer_in_tablet && in_tablet) {
+            /* Mouse entered laptop -> tablet screen: wake frame clock */
+            g_pointer_in_tablet = 1;
+            toggle = (toggle == 1) ? 2 : 1;
+            XResizeWindow(g_x11_dpy, g_nudge_win, toggle, 1);
+            XFlush(g_x11_dpy);
+        } else if (!g_pointer_in_tablet &&
+                   rx >= (g_tablet_x - 40) && rx < g_tablet_x &&
+                   ry >= g_tablet_y && ry < (g_tablet_y + g_tablet_h)) {
+            /* Mouse approaching tablet boundary (within 40px): pre-warm frame clock */
+            long long now = now_us();
+            if (now - last_prewarm > 40000) { /* 25Hz max during approach */
+                last_prewarm = now;
+                toggle = (toggle == 1) ? 2 : 1;
+                XResizeWindow(g_x11_dpy, g_nudge_win, toggle, 1);
+                XFlush(g_x11_dpy);
+            }
+        }
+    }
+    return NULL;
+}
+
+static void init_boundary_sync(void) {
+    const char *disp_env = getenv("DISPLAY");
+    if (!disp_env) {
+        disp_env = ":0";
+    }
+    g_x11_dpy = XOpenDisplay(disp_env);
+    if (!g_x11_dpy) {
+        fprintf(stderr, "[evdi-helper] Boundary sync: could not open X11 display %s\n", disp_env);
+        return;
+    }
+
+    Window root = DefaultRootWindow(g_x11_dpy);
+    XRRScreenResources *res = XRRGetScreenResourcesCurrent(g_x11_dpy, root);
+    if (res) {
+        for (int i = 0; i < res->noutput; i++) {
+            XRROutputInfo *info = XRRGetOutputInfo(g_x11_dpy, res, res->outputs[i]);
+            if (info && info->connection == RR_Connected && info->crtc) {
+                if (strstr(info->name, "DVI-") || strstr(info->name, "UScreen") || strstr(info->name, "evdi")) {
+                    XRRCrtcInfo *crtc = XRRGetCrtcInfo(g_x11_dpy, res, info->crtc);
+                    if (crtc) {
+                        g_tablet_x = crtc->x;
+                        g_tablet_y = crtc->y;
+                        g_tablet_w = crtc->width;
+                        g_tablet_h = crtc->height;
+                        XRRFreeCrtcInfo(crtc);
+                    }
+                }
+            }
+            if (info) XRRFreeOutputInfo(info);
+        }
+        XRRFreeScreenResources(res);
+    }
+
+    fprintf(stderr, "[evdi-helper] Boundary sync initialized: tablet output at (%d,%d) %dx%d\n",
+            g_tablet_x, g_tablet_y, g_tablet_w, g_tablet_h);
+
+    XSetWindowAttributes attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.override_redirect = True;
+    attr.background_pixel = 0;
+    g_nudge_win = XCreateWindow(g_x11_dpy, root,
+                                g_tablet_x + 1, g_tablet_y + 1, 1, 1, 0,
+                                CopyFromParent, InputOutput, CopyFromParent,
+                                CWOverrideRedirect | CWBackPixel, &attr);
+    XSelectInput(g_x11_dpy, g_nudge_win, ExposureMask);
+    XMapWindow(g_x11_dpy, g_nudge_win);
+    XFlush(g_x11_dpy);
+
+    g_boundary_running = 1;
+    if (pthread_create(&g_boundary_thread, NULL, boundary_sync_thread, NULL) != 0) {
+        fprintf(stderr, "[evdi-helper] Failed to start boundary sync thread\n");
+        g_boundary_running = 0;
+    }
+}
+
+static void cleanup_boundary_sync(void) {
+    if (g_boundary_running) {
+        g_boundary_running = 0;
+        if (g_boundary_thread) pthread_join(g_boundary_thread, NULL);
+        g_boundary_thread = 0;
+    }
+    if (g_x11_dpy) {
+        if (g_nudge_win) {
+            XDestroyWindow(g_x11_dpy, g_nudge_win);
+            g_nudge_win = 0;
+        }
+        XCloseDisplay(g_x11_dpy);
+        g_x11_dpy = NULL;
+    }
 }
 
 static long long now_ms(void) {
@@ -669,6 +807,7 @@ static void grab_now(void) {
     if (num_rects > 0) {
         g_grab_count++;
         g_grab_us = now_us();
+        g_last_exit_time_us = 0;
         /* Under the swap lock: the writer thread reassigns the mask pointers
            when it takes a frame, so touching them unlocked would race.
            If the driver returned more rectangles than we gave it room for,
@@ -686,24 +825,17 @@ static void grab_now(void) {
 static void on_update_ready(int buffer_to_be_updated, void *user_data) {
     (void)user_data;
     (void)buffer_to_be_updated;
+    long long wait_us = 0;
     if (g_update_pending) {
-        g_wait_sum_us += now_us() - g_req_us;
+        wait_us = now_us() - g_req_us;
+        g_wait_sum_us += wait_us;
         g_wait_n++;
     }
     g_update_pending = 0;
     grab_now();
-    /* Ask for the next frame straight away rather than at the next tick of
-       the target period. The cycle is serial by the driver's design — the
-       compositor's flip only completes once we have copied the frame out,
-       and it renders the next one after that — so at 2960x1848 the two
-       halves (about 9 ms in KWin, 6 ms in the grab) already take a frame
-       period or more. Gating the request on the period as well pushed the
-       next request past the compositor's vblank slot, so a 30 fps target
-       delivered 24 and a 90 fps target 50-ish. The mode's refresh rate is
-       what paces the compositor; nothing here needs to hold it back. Asking
-       first from inside this handler, before the grab, was tried and is
-       worse (16 fps): the driver answers at once with the not-yet-grabbed
-       damage and the cycle falls apart. */
+    if (wait_us > 15000) {
+        fprintf(stderr, "[evdi-helper] UPDATE_READY after %lld us (%.1f ms)\n", wait_us, wait_us / 1000.0);
+    }
     if (g_pipeline)
         g_last_request_ms = 0;
 }
@@ -715,12 +847,13 @@ static void on_crtc_state(int state, void *user_data) {
 
 static void on_cursor_set(struct evdi_cursor_set cursor_set, void *user_data) {
     (void)user_data;
-    (void)cursor_set;
+    fprintf(stderr, "[evdi-helper] ON_CURSOR_SET enabled=%d hot=(%d,%d) size=(%ux%u)\n",
+            cursor_set.enabled, cursor_set.hot_x, cursor_set.hot_y, cursor_set.width, cursor_set.height);
 }
 
 static void on_cursor_move(struct evdi_cursor_move cursor_move, void *user_data) {
     (void)user_data;
-    (void)cursor_move;
+    fprintf(stderr, "[evdi-helper] ON_CURSOR_MOVE pos=(%d,%d)\n", cursor_move.x, cursor_move.y);
 }
 
 /* (Re)open the capture FIFO without blocking forever: O_NONBLOCK open fails
@@ -830,6 +963,16 @@ static void *writer_thread(void *arg) {
         long long now_ms_write = now_ms();
         if (!fresh && (now_ms_write - g_last_write_ms) < IDLE_KEEPALIVE_MS)
             continue;
+
+        /* Suppress re-sending stale frames containing a departed cursor during
+           the boundary transition (< 100ms after exit), until the compositor's
+           clean frame arrives. */
+        if (!fresh && g_last_exit_time_us > 0) {
+            long long since_exit_ms = (now_us() - g_last_exit_time_us) / 1000;
+            if (since_exit_ms < 100) {
+                continue;
+            }
+        }
         g_last_write_ms = now_ms_write;
 
         /* Rate limit against an absolute schedule, never against "now".
@@ -1138,7 +1281,7 @@ int main(int argc, char *argv[]) {
     }
     g_device_index = dev_idx;
     g_handle = handle;
-    evdi_enable_cursor_events(handle, false);
+    evdi_enable_cursor_events(handle, true);
 
     FILE *f = fopen(edid_path, "rb");
     if (!f) {
@@ -1190,7 +1333,9 @@ int main(int argc, char *argv[]) {
     }
 
     fprintf(stderr, "[evdi-helper] Connected. Capture at %d fps. Entering event loop.\n", g_fps);
+    init_boundary_sync();
     run_event_loop(handle);
+    cleanup_boundary_sync();
 
     g_running = 0;
     /* Wake the writer out of its condition wait so shutdown is immediate

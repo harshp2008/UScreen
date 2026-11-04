@@ -105,6 +105,48 @@ static int g_idle_keepalive_ms = DEFAULT_IDLE_KEEPALIVE_MS;
 static long long g_last_write_ms = 0;
 
 static long long now_us(void);
+/* Inter-process shared memory ring for microsecond stage timestamp tracking */
+#define TIMING_RING_SIZE 1024
+#define TIMING_MAGIC 0x55534352 /* 'USCR' */
+#define TIMING_VERSION 1
+
+struct FrameTimingRecord {
+    uint32_t seq;
+    uint32_t is_fresh;
+    uint64_t t_request_us;      /* Mutter frame request */
+    uint64_t t_ready_us;        /* Stage a: EVDI receives UPDATE_READY */
+    uint64_t t_grab_done_us;    /* Stage b: evdi_grab_pixels completes */
+    uint64_t t_conv_done_us;    /* Stage b': NV12 conversion complete */
+    uint64_t t_fifo_write_us;   /* Stage c: FIFO write completes (FFmpeg receives frame) */
+};
+
+struct SharedTimingRing {
+    uint32_t magic;
+    uint32_t version;
+    struct FrameTimingRecord records[TIMING_RING_SIZE];
+};
+
+static const char *g_timing_shm_path = NULL;
+static struct SharedTimingRing *g_timing_shm = NULL;
+static int g_timing_shm_fd = -1;
+static uint32_t g_fifo_seq = 0;
+
+static long long g_ready_us = 0;
+static long long g_conv_us = 0;
+
+static long long g_latest_req_us = 0;
+static long long g_latest_ready_us = 0;
+static long long g_latest_conv_us = 0;
+
+static long long g_write_req_us = 0;
+static long long g_write_ready_us = 0;
+static long long g_write_conv_us = 0;
+
+static long long g_conv_sum_us = 0;
+static int g_conv_n = 0;
+static long long g_write_sum_us = 0;
+static int g_write_n = 0;
+
 /* Capture-side latency: grab → NV12 → handed to the encoder's FIFO.
    Reported as percentiles so the cost of the pipe-to-ffmpeg design can be
    compared against the decode and wire costs measured on the other side. */
@@ -296,6 +338,43 @@ static long long now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static void init_timing_shm(const char *path) {
+    if (!path) return;
+    g_timing_shm_fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (g_timing_shm_fd < 0) {
+        fprintf(stderr, "[evdi-helper] Could not open timing shm %s: %s\n", path, strerror(errno));
+        return;
+    }
+    if (ftruncate(g_timing_shm_fd, sizeof(struct SharedTimingRing)) != 0) {
+        fprintf(stderr, "[evdi-helper] ftruncate failed on %s: %s\n", path, strerror(errno));
+        close(g_timing_shm_fd);
+        g_timing_shm_fd = -1;
+        return;
+    }
+    void *ptr = mmap(NULL, sizeof(struct SharedTimingRing), PROT_READ | PROT_WRITE, MAP_SHARED, g_timing_shm_fd, 0);
+    if (ptr == MAP_FAILED) {
+        fprintf(stderr, "[evdi-helper] mmap failed on %s: %s\n", path, strerror(errno));
+        close(g_timing_shm_fd);
+        g_timing_shm_fd = -1;
+        return;
+    }
+    g_timing_shm = (struct SharedTimingRing *)ptr;
+    g_timing_shm->magic = TIMING_MAGIC;
+    g_timing_shm->version = TIMING_VERSION;
+    fprintf(stderr, "[evdi-helper] High-resolution timing SHM initialized at %s\n", path);
+}
+
+static void cleanup_timing_shm(void) {
+    if (g_timing_shm && g_timing_shm != MAP_FAILED) {
+        munmap(g_timing_shm, sizeof(struct SharedTimingRing));
+        g_timing_shm = NULL;
+    }
+    if (g_timing_shm_fd >= 0) {
+        close(g_timing_shm_fd);
+        g_timing_shm_fd = -1;
+    }
 }
 
 static void on_dpms(int dpms_mode, void *user_data) {
@@ -641,9 +720,13 @@ static void publish_frame(void) {
     if (!g_buffers_ready || !g_framebuffer)
         return;
 
+    long long t_c0 = now_us();
     /* Only the rows this particular buffer is missing. */
     bgra_to_nv12(g_framebuffer, g_fill, g_dirty_fill);
     memset(g_dirty_fill, 0, (size_t)g_dirty_bytes);
+    g_conv_us = now_us();
+    g_conv_sum_us += g_conv_us - t_c0;
+    g_conv_n++;
 
     pthread_mutex_lock(&g_swap_mutex);
     unsigned char *tmp = g_latest;
@@ -654,7 +737,10 @@ static void publish_frame(void) {
     g_dirty_latest = g_dirty_fill;
     g_dirty_fill = dtmp;
     g_latest_valid = 1;
+    g_latest_req_us = g_req_us;
+    g_latest_ready_us = g_ready_us;
     g_latest_grab_us = g_grab_us;
+    g_latest_conv_us = g_conv_us;
     pthread_cond_signal(&g_frame_ready);
     pthread_mutex_unlock(&g_swap_mutex);
 }
@@ -832,9 +918,10 @@ static void grab_now(void) {
 static void on_update_ready(int buffer_to_be_updated, void *user_data) {
     (void)user_data;
     (void)buffer_to_be_updated;
+    g_ready_us = now_us();
     long long wait_us = 0;
     if (g_update_pending) {
-        wait_us = now_us() - g_req_us;
+        wait_us = g_ready_us - g_req_us;
         g_wait_sum_us += wait_us;
         g_wait_n++;
     }
@@ -935,7 +1022,10 @@ static void *writer_thread(void *arg) {
             g_dirty_write = g_dirty_latest;
             g_dirty_latest = dtmp;
             g_latest_valid = 0;
+            g_write_req_us = g_latest_req_us;
+            g_write_ready_us = g_latest_ready_us;
             g_write_grab_us = g_latest_grab_us;
+            g_write_conv_us = g_latest_conv_us;
             have_frame = 1;
             fresh = 1;
         }
@@ -969,6 +1059,7 @@ static void *writer_thread(void *arg) {
 
         /* Bounded write: if the encoder stops reading for >250ms per chunk
            it is stalled or dead — close the FIFO and resync on reopen. */
+        long long t_write_start = now_us();
         const unsigned char *ptr = g_write;
         size_t remaining = (size_t)size;
         while (remaining > 0 && g_running) {
@@ -992,6 +1083,24 @@ static void *writer_thread(void *arg) {
             remaining -= (size_t)written;
         }
         g_writer_busy = 0;
+        long long t_fifo_done = now_us();
+        if (remaining == 0) {
+            g_write_sum_us += t_fifo_done - t_write_start;
+            g_write_n++;
+        }
+
+        uint32_t seq = g_fifo_seq++;
+        if (g_timing_shm && remaining == 0) {
+            uint32_t idx = seq % TIMING_RING_SIZE;
+            g_timing_shm->records[idx].seq = seq;
+            g_timing_shm->records[idx].is_fresh = fresh ? 1 : 0;
+            g_timing_shm->records[idx].t_request_us = (uint64_t)g_write_req_us;
+            g_timing_shm->records[idx].t_ready_us = (uint64_t)g_write_ready_us;
+            g_timing_shm->records[idx].t_grab_done_us = (uint64_t)g_write_grab_us;
+            g_timing_shm->records[idx].t_conv_done_us = (uint64_t)g_write_conv_us;
+            g_timing_shm->records[idx].t_fifo_write_us = (uint64_t)t_fifo_done;
+            __sync_synchronize();
+        }
 
         /* Only freshly grabbed frames say anything about capture latency */
         if (fresh && remaining == 0 && g_write_grab_us > 0
@@ -1071,6 +1180,7 @@ static void run_event_loop(evdi_handle handle) {
             g_req_us = now_us();
             if (evdi_request_update(handle, 0)) {
                 g_immediate_n++;
+                g_ready_us = g_req_us;
                 grab_now();
             } else {
                 g_update_pending = 1;
@@ -1090,11 +1200,14 @@ static void run_event_loop(evdi_handle handle) {
             fprintf(stderr, "[evdi-helper] %.1f grabs/s (total %lld), mode:%d dpms:%d pending:%d\n",
                     elapsed > 0 ? grabs / elapsed : 0,
                     g_grab_count, g_have_mode, g_dpms_on, g_update_pending);
-            fprintf(stderr, "[evdi-helper] cycle: request→ready avg %.1fms (%d waited, %d immediate), grab avg %.1fms (%d, %d empty)\n",
+            fprintf(stderr, "[evdi-helper] stages: req→ready avg %.1fms (%d waited, %d imm), grab avg %.1fms, conv avg %.1fms, write avg %.1fms\n",
                     g_wait_n ? g_wait_sum_us / 1000.0 / g_wait_n : 0.0, g_wait_n, g_immediate_n,
-                    g_grab_n ? g_grab_sum_us / 1000.0 / g_grab_n : 0.0, g_grab_n, g_empty_n);
+                    g_grab_n ? g_grab_sum_us / 1000.0 / g_grab_n : 0.0,
+                    g_conv_n ? g_conv_sum_us / 1000.0 / g_conv_n : 0.0,
+                    g_write_n ? g_write_sum_us / 1000.0 / g_write_n : 0.0);
             g_wait_sum_us = 0; g_wait_n = 0; g_grab_sum_us = 0; g_grab_n = 0;
             g_immediate_n = 0; g_empty_n = 0;
+            g_conv_sum_us = 0; g_conv_n = 0; g_write_sum_us = 0; g_write_n = 0;
 
             /* Capture-side latency: grab → convert → into the encoder's FIFO. */
             pthread_mutex_lock(&g_swap_mutex);
@@ -1185,6 +1298,8 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--max-performance") == 0) {
             g_idle_keepalive_ms = 16;
             fprintf(stderr, "[evdi-helper] Max Performance Mode enabled: idle keepalive set to 16ms (~60 FPS)\n");
+        } else if (strcmp(argv[i], "--timing-shm") == 0 && i + 1 < argc) {
+            g_timing_shm_path = argv[++i];
         }
     }
 
@@ -1292,6 +1407,9 @@ int main(int argc, char *argv[]) {
     pthread_t writer = 0;
     if (fifo_path) {
         g_fifo_path = fifo_path;
+        if (g_timing_shm_path) {
+            init_timing_shm(g_timing_shm_path);
+        }
         conv_pool_init();   /* spawn NV12 conversion workers before first grab */
         fprintf(stderr, "[evdi-helper] Capture FIFO: %s (opened on demand)\n", fifo_path);
         if (pthread_create(&writer, NULL, writer_thread, NULL) != 0) {
@@ -1325,6 +1443,7 @@ int main(int argc, char *argv[]) {
     evdi_disconnect(handle);
     evdi_close(handle);
     g_handle = EVDI_INVALID_HANDLE;
+    cleanup_timing_shm();
 
     fprintf(stderr, "[evdi-helper] Done.\n");
     return 0;

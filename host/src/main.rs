@@ -14,6 +14,7 @@ mod latency;
 mod osk;
 mod runtime;
 mod stream;
+pub mod timing;
 mod tray;
 mod update;
 mod vdisplay;

@@ -269,12 +269,21 @@ class VideoReceiver {
                     format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
                 }
                 try {
-                    // Ask the decoder to run flat out rather than pace to the
-                    // frame rate — headroom above the stream rate, so a late
-                    // frame is caught up on instead of waiting for the next slot.
-                    format.setInteger("operating-rate", streamFps * 2)
+                    // Realtime priority: tells Android framework and Codec2 to prioritize
+                    // frame scheduling over power saving.
+                    format.setInteger(MediaFormat.KEY_PRIORITY, 0)
                 } catch (_: Exception) {}
                 try {
+                    // Operating rate: request the target stream rate without exceeding hardware
+                    // limits on high-resolution displays (e.g. 2560x1600 / 2880x1800).
+                    format.setInteger(MediaFormat.KEY_OPERATING_RATE, streamFps)
+                } catch (_: Exception) {}
+                try {
+                    // Samsung Exynos low-latency decoder mode
+                    format.setInteger("vendor.sec-ext-dec-low-latency.enable", 1)
+                } catch (_: Exception) {}
+                try {
+                    // Qualcomm Snapdragon low-latency decoder mode
                     format.setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
                 } catch (_: Exception) {}
             } else {

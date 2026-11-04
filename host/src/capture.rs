@@ -663,6 +663,8 @@ impl CaptureManager {
         }
 
         cmd.args(["--capture-fifo", &fifo]);
+        let timing_shm = crate::runtime::timing_path_for(self.config.instance);
+        cmd.args(["--timing-shm", &timing_shm.to_string_lossy()]);
         if let Some(card) = self.config.card {
             cmd.args(["--card", &card.to_string()]);
         }
@@ -957,6 +959,8 @@ impl CaptureManager {
                 gop.to_string(),
                 "-idr_interval".into(),
                 "1".into(),
+                "-async_depth".into(),
+                "1".into(),
             ]);
             if encoder == "hevc_vaapi" {
                 // Main profile uses direct 8-bit NV12 hardware encoding on Intel Arc
@@ -1249,7 +1253,8 @@ impl CaptureManager {
                     let (tx2, cc, lat) =
                         (tx.clone(), self.codec_config.clone(), self.latency.clone());
                     let codec = Codec::from_encoder(&self.config.encoder);
-                    tokio::spawn(async move { Self::read_loop(stdout, tx2, cc, lat, codec).await })
+                    let timing_shm = crate::runtime::timing_path_for(self.config.instance);
+                    tokio::spawn(async move { Self::read_loop(stdout, tx2, cc, lat, codec, timing_shm).await })
                 }
                 #[cfg(feature = "inproc-encoder")]
                 {
@@ -1487,6 +1492,7 @@ impl CaptureManager {
         codec_config: Arc<Mutex<Option<Bytes>>>,
         latency: crate::latency::LatencyTracker,
         codec: Codec,
+        timing_shm: std::path::PathBuf,
     ) -> Result<()> {
         let mut buf = vec![0u8; 512 * 1024];
         let mut total: u64 = 0;
@@ -1494,6 +1500,7 @@ impl CaptureManager {
         let mut last_log = Instant::now();
         let mut packetizer = H264AnnexBPacketizer::new(codec);
         let mut config_extracted = codec_config.lock().ok().and_then(|g| g.clone()).is_some();
+        let timing_reader = crate::timing::TimingReader::open(&timing_shm);
 
         loop {
             let n = stdout
@@ -1528,10 +1535,28 @@ impl CaptureManager {
                 }
             }
 
+            let now_us = crate::timing::now_monotonic_us();
             for data in access_units {
                 frames += 1;
                 if tx.receiver_count() > 0 {
-                    latency.on_encoded(data.seq);
+                    let detailed = timing_reader.as_ref().and_then(|tr| tr.get_record(data.seq)).map(|rec| {
+                        let req_to_ready_us = rec.t_ready_us.saturating_sub(rec.t_request_us) as u32;
+                        let grab_us = rec.t_grab_done_us.saturating_sub(rec.t_ready_us) as u32;
+                        let conv_us = rec.t_conv_done_us.saturating_sub(rec.t_grab_done_us) as u32;
+                        let fifo_wait_write_us = rec.t_fifo_write_us.saturating_sub(rec.t_conv_done_us) as u32;
+                        let encode_us = now_us.saturating_sub(rec.t_fifo_write_us) as u32;
+                        let host_total_us = now_us.saturating_sub(rec.t_ready_us) as u32;
+                        crate::latency::DetailedTiming {
+                            is_fresh: rec.is_fresh != 0,
+                            req_to_ready_us,
+                            grab_us,
+                            conv_us,
+                            fifo_wait_write_us,
+                            encode_us,
+                            host_total_us,
+                        }
+                    });
+                    latency.on_encoded_with_timing(data.seq, detailed);
                     let _ = tx.send(data);
                 }
             }

@@ -71,16 +71,20 @@ perf(hevc): implement low-latency VAAPI tuning and eliminate Exynos Codec2 deadl
 
 ---
 
-### Commit 6: Per-Device Hardware Encoder Overrides & Multi-Device Routing
+### Commit 6: Multi-Device UX Architecture Redesign & Full Per-Device Overrides
 ```text
-feat(multi-device): support per-device hardware encoder overrides in daemon and GUI
+feat(gui): overhaul multi-device management with sidebar navigation and full overrides
 
-- Extend TabletProfile in host/src/config.rs with optional encoder: Option<String> field.
-- Persist per-device encoder overrides under [tablets.<serial>] in config.toml.
-- Dynamically resolve encoder overrides in spawn_extra_session and apply_tablet_profile.
-- Guard settings persistence so active device overrides never overwrite the global encoder setting.
-- Update WebSocket handshake in host/src/input.rs to announce the correct codec bitstream.
-- Overhaul gui/src/main.rs to display connected tablets and per-device encoder dropdowns.
+- Redesign uscreen-gui architecture from monolithic scroll view to a dedicated
+  left-sidebar navigation layout (Global Settings vs individual connected/saved devices).
+- Extend TabletProfile/DeviceProfile in host/src/config.rs with nickname, ten_bit,
+  and alias support (#[serde(alias = "devices")]).
+- Implement full per-device configuration overrides across all properties:
+  encoder, fps, quality, bitrate, 10-bit, stream_scale, position, and resolution.
+- Add user-editable nicknames in GUI with automatic fallback to ADB model name.
+- Transition UI terminology from "Tablet" to generic "Device" semantics.
+- Add pinned bottom action bar with persistent Apply & restart / Discard controls.
+- Prevent active device overrides from overwriting global defaults in config.toml.
 - Stabilize uscreen-gui against accesskit/zbus executor panics by scoping native rendering.
 ```
 

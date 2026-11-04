@@ -312,6 +312,7 @@ async fn run_daemon(cli: Cli) -> Result<()> {
         width_mm: edid::DEFAULT_WIDTH_MM,
         height_mm: edid::DEFAULT_HEIGHT_MM,
         stream_scale,
+        ten_bit: file_cfg.ten_bit,
     });
 
     let mut capture_mgr = capture::CaptureManager::new(cap_config);
@@ -436,21 +437,25 @@ async fn run_daemon(cli: Cli) -> Result<()> {
         while settings_rx_save.changed().await.is_ok() {
             let s = settings_rx_save.borrow().clone();
             let mut cfg = config::FileConfig::load();
-            let has_device_encoder = serial_rx_save
-                .borrow()
-                .as_ref()
-                .and_then(|serial| cfg.tablets.get(serial))
-                .and_then(|p| p.encoder.as_ref())
-                .is_some();
-            if !cli_overrides.0 && !has_device_encoder {
-                cfg.encoder = s.encoder;
-            }
-            if !cli_overrides.1 { cfg.fps = s.fps; }
-            if !cli_overrides.2 { cfg.bitrate = s.bitrate; }
+            let (has_enc_override, has_fps_override, has_bitrate_override, has_quality_override, has_scale_override, has_ten_bit_override) =
+                if let Some(serial) = serial_rx_save.borrow().as_ref() {
+                    if let Some(p) = cfg.tablets.get(serial) {
+                        (p.encoder.is_some(), p.fps.is_some(), p.bitrate.is_some(), p.quality.is_some(), p.stream_scale.is_some(), p.ten_bit.is_some())
+                    } else {
+                        (false, false, false, false, false, false)
+                    }
+                } else {
+                    (false, false, false, false, false, false)
+                };
+
+            if !cli_overrides.0 && !has_enc_override { cfg.encoder = s.encoder; }
+            if !cli_overrides.1 && !has_fps_override { cfg.fps = s.fps; }
+            if !cli_overrides.2 && !has_bitrate_override { cfg.bitrate = s.bitrate; }
             if !cli_overrides.3 { cfg.width = s.width; }
             if !cli_overrides.4 { cfg.height = s.height; }
-            if !cli_overrides.5 { cfg.quality = s.quality; }
-            if !cli_overrides.6 { cfg.stream_scale = s.stream_scale; }
+            if !cli_overrides.5 && !has_quality_override { cfg.quality = s.quality; }
+            if !cli_overrides.6 && !has_scale_override { cfg.stream_scale = s.stream_scale; }
+            if !has_ten_bit_override { cfg.ten_bit = s.ten_bit; }
             // And against this tablet's serial, so the next session with it
             // builds the right display immediately instead of rebuilding.
             if let Some(serial) = serial_rx_save.borrow().clone() {
@@ -783,12 +788,38 @@ fn spawn_extra_session(t: &ExtraSessionTemplate, instance: u32, serial: &str) ->
     let cards = vdisplay::evdi_cards();
     let mut cfg = t.cap_template.clone();
     cfg.instance = instance;
-    // Check if this tablet has an encoder override configured
+    // Check if this device has per-device overrides configured
     let file_cfg = config::FileConfig::load();
     if let Some(p) = file_cfg.tablets.get(serial) {
         if let Some(ref enc) = p.encoder {
             if !enc.trim().is_empty() {
                 cfg.encoder = enc.clone();
+            }
+        }
+        if let Some(fps) = p.fps {
+            cfg.fps = fps;
+        }
+        if let Some(bitrate) = p.bitrate {
+            cfg.bitrate = bitrate;
+        }
+        if let Some(quality) = p.quality {
+            cfg.quality = quality;
+        }
+        if let Some(stream_scale) = p.stream_scale {
+            cfg.stream_scale = stream_scale;
+        }
+        if let Some(ten_bit) = p.ten_bit {
+            cfg.ten_bit = ten_bit;
+        }
+        if let Some(ref pos) = p.position {
+            cfg.position = config::Position::parse_or_default(pos);
+        }
+        if p.has_display() {
+            cfg.width = p.width;
+            cfg.height = p.height;
+            if p.width_mm > 0 && p.height_mm > 0 {
+                cfg.width_mm = p.width_mm;
+                cfg.height_mm = p.height_mm;
             }
         }
     }
@@ -823,6 +854,7 @@ fn spawn_extra_session(t: &ExtraSessionTemplate, instance: u32, serial: &str) ->
         width_mm: cfg.width_mm,
         height_mm: cfg.height_mm,
         stream_scale: cfg.stream_scale,
+        ten_bit: cfg.ten_bit,
     });
     let settings_tx_keep = settings_tx.clone();
     let mut cap = capture::CaptureManager::new(cfg.clone());
@@ -1294,7 +1326,7 @@ async fn tablet_ip(serial: &str) -> Option<String> {
 /// On a slow machine that was half a minute of black screen at every start.
 async fn apply_tablet_profile(serial: &str, settings_tx: &watch::Sender<capture::EncoderSettings>) {
     let mut cfg = config::FileConfig::load();
-    let Some(p) = cfg.tablets.get(serial).cloned() else {
+    let Some(mut p) = cfg.tablets.get(serial).cloned() else {
         // First time this tablet is seen: note it, so the file shows what is
         // known even before it has reported anything.
         if !is_fake_serial(serial) {
@@ -1310,18 +1342,22 @@ async fn apply_tablet_profile(serial: &str, settings_tx: &watch::Sender<capture:
         }
         return;
     };
+    if p.label.trim().is_empty() && !is_fake_serial(serial) {
+        if let Ok(o) = tokio::process::Command::new("adb")
+            .args(["-s", serial, "shell", "getprop", "ro.product.model"])
+            .output()
+            .await
+        {
+            let label = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !label.is_empty() {
+                p.label = label.clone();
+                cfg.tablets.entry(serial.to_string()).or_default().label = label;
+                let _ = cfg.save();
+            }
+        }
+    }
     let mut s = settings_tx.borrow().clone();
-    let before = (
-        s.width,
-        s.height,
-        s.width_mm,
-        s.height_mm,
-        s.fps,
-        s.bitrate,
-        s.quality,
-        s.stream_scale,
-        s.encoder.clone(),
-    );
+    let before = s.clone();
     if p.has_display() {
         s.width = p.width;
         s.height = p.height;
@@ -1330,39 +1366,26 @@ async fn apply_tablet_profile(serial: &str, settings_tx: &watch::Sender<capture:
             s.height_mm = p.height_mm;
         }
     }
-    if let Some(v) = p.fps { s.fps = v; }
-    if let Some(v) = p.bitrate { s.bitrate = v; }
-    if let Some(v) = p.quality { s.quality = v; }
-    if let Some(v) = p.stream_scale { s.stream_scale = v.max(1); }
-    if let Some(ref enc) = p.encoder {
-        if !enc.trim().is_empty() {
-            s.encoder = enc.clone();
-        } else {
-            s.encoder = cfg.encoder.clone();
-        }
-    } else {
-        s.encoder = cfg.encoder.clone();
-    }
-    if before == (
-        s.width,
-        s.height,
-        s.width_mm,
-        s.height_mm,
-        s.fps,
-        s.bitrate,
-        s.quality,
-        s.stream_scale,
-        s.encoder.clone(),
-    ) {
+    s.fps = p.fps.unwrap_or(cfg.fps);
+    s.bitrate = p.bitrate.unwrap_or(cfg.bitrate);
+    s.quality = p.quality.unwrap_or(cfg.quality);
+    s.stream_scale = p.stream_scale.unwrap_or(cfg.stream_scale).max(1);
+    s.encoder = p.encoder.as_ref().filter(|e| !e.trim().is_empty()).cloned().unwrap_or(cfg.encoder.clone());
+    s.ten_bit = p.ten_bit.unwrap_or(cfg.ten_bit);
+
+    if before == s {
         return;
     }
     info!(
-        "Tablet profile applied for {}{}: {}x{} ({}x{} mm), encoder: {} ({})",
+        "Device profile applied for {} ({}): {}x{}@{}fps, encoder: {}, bitrate: {}k, quality: {}, scale: {}, 10-bit: {}",
+        p.display_name(serial),
         serial,
-        if p.label.is_empty() { String::new() } else { format!(" ({})", p.label) },
-        s.width, s.height, s.width_mm, s.height_mm,
+        s.width, s.height, s.fps,
         s.encoder,
-        if p.encoder.is_some() { "device override" } else { "global default" }
+        s.bitrate,
+        s.quality,
+        s.stream_scale,
+        s.ten_bit,
     );
     let _ = settings_tx.send(s);
 }

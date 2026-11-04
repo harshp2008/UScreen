@@ -126,6 +126,7 @@ pub struct EncoderSettings {
     pub height_mm: u32,
     /// Integer downscale for the stream; see `config::FileConfig::stream_scale`.
     pub stream_scale: u32,
+    pub ten_bit: bool,
 }
 
 /// Why the helper cannot get an EVDI device, in the words of someone who can
@@ -1140,6 +1141,7 @@ impl CaptureManager {
                 self.config.width_mm = s.width_mm;
                 self.config.height_mm = s.height_mm;
                 self.config.stream_scale = s.stream_scale;
+                self.config.ten_bit = s.ten_bit;
             }
 
             // No tablet being used as a screen: no helper, and so no EVDI

@@ -13,7 +13,9 @@ Over an intensive multi-phase investigation on modern hardware (Intel Core Ultra
 
 ### Summary Highlights:
 - **High-Efficiency Video Coding (HEVC / H.265) & 10-bit VAAPI**: Integrated native `hevc_vaapi` hardware encoding with low-latency tuning (`-b_depth 1 -sei 0 -aud 0 -async_depth 1`), unlocking 10-bit precision (HEVC Main10) and cutting stream bandwidth by **~7.6%** to **~15%** while maintaining a locked 90 FPS / 60 FPS.
-- **Per-Device Hardware Encoder Overrides**: Decoupled the host daemon and GUI from a single global encoder setting. Individual tablets and phones connected simultaneously can now run custom encoders (e.g., HEVC on a flagship tablet alongside H.264 on a legacy device) via `[tablets.<serial>].encoder` with dynamic fallback.
+- **Architectural Multi-Device UX & Sidebar Navigation**: Completely redesigned `uscreen-gui` from a monolithic scroll list into a modern, responsive Left Sidebar navigation separating Global Configuration from individual Device Views, with persistent pinned status/apply controls.
+- **Comprehensive Per-Device Overrides & Nicknames**: Decoupled ALL settings (Encoder, Frame Rate, Quality, Bitrate, 10-bit Color Depth, Stream Detail / Scale, Screen Position, Custom Resolution) per device with intuitive "Override" / "Inherit Global" toggles. Added user-editable nicknames persisted in `~/.config/uscreen/config.toml` with automatic ADB model fallback.
+- **Modernized Device Semantics**: Transitioned GUI and daemon semantics from rigid "Tablet" terminology to universal "Device" semantics supporting phones, foldables, and portable monitors.
 - **Opt-In Android Immersive UI**: Implemented an edge-to-edge full-screen immersive display mode on Android with cutout notch handling, system gesture isolation, and a contextual back-button settings sheet, defaulting strictly to `false` for backwards compatibility.
 - **System-Wide Frame Pacing & Max Performance Mode**: Engineered microsecond-precision hardware capture pacing via POSIX monotonic clocks and high-resolution timer queues, eliminating compositor starvation and adding an optional **Max Performance Mode** to sustain 60/90 FPS independent of primary cursor focus when on AC/performance power profiles.
 - **Kernel & Compositor Synchronization (Ghost Cursor Fix)**: Resolved the long-standing Mutter Wayland boundary cursor freeze and EVDI DRM mutex race via a 1x1 X11 dynamic boundary synchronization engine and kernel module ordering rules (`softdep evdi pre: drm_kms_helper i915`).
@@ -30,10 +32,22 @@ Over an intensive multi-phase investigation on modern hardware (Intel Core Ultra
 - **Graceful Fallback**: Implemented automatic host fallback to `h264_vaapi` if the GPU driver rejects HEVC entrypoints.
 - **10-Bit Main10 Pipeline**: Supports 10-bit color precision on supported hardware, eliminating color banding on desktop gradients.
 
-### 2.2 Per-Device Encoder Overrides & Multi-Device Topologies
-- **Flexible Profile Schema**: Extended `TabletProfile` in `host/src/config.rs` with `pub encoder: Option<String>`, persisted under `[tablets.<serial>]` in `~/.config/uscreen/config.toml`.
-- **Dynamic Bitstream Negotiation**: Updated `host/src/input.rs` WebSocket handshakes to report the exact bitstream format (`"hevc"` or `"h264"`) active on that specific tablet's pipeline, ensuring seamless client `MediaCodec` initialization.
-- **Multi-Device GUI Controls**: Overhauled `gui/src/main.rs` to detect all attached tablets via ADB, providing per-device encoder dropdowns defaulting to `"Follow Global Setting"` alongside explicit hardware encoder options.
+### 2.2 Architectural Multi-Device UX & Full Per-Device Overrides
+- **Left Sidebar Navigation Architecture**: Overhauled `gui/src/main.rs` with an intuitive split-pane layout featuring a permanent left sidebar (`SidePanel::left`), dedicated Global Settings view, and individual Device Views for every connected or saved device.
+- **Full Spectrum Per-Device Overrides**: Decoupled ALL stream and hardware properties per-device:
+  - Hardware Encoder (`encoder`)
+  - Frame Rate (`fps`: 30, 60, 90 FPS)
+  - Text Quality Quantizer (`quality`: 12..=32)
+  - Bitrate Ceiling (`bitrate`: 5..=60 Mbps)
+  - Colour Depth (`ten_bit`: 10-bit HEVC Main10 vs 8-bit)
+  - Stream Detail / Downscaling (`stream_scale`: Full vs Half)
+  - Screen Position (`position`: Left, Right, Above, Below)
+  - Virtual Resolution (`width` × `height` custom modes)
+- **User-Editable Device Nicknames**: Added `nickname: Option<String>` to `TabletProfile` (`DeviceProfile`), enabling users to assign human-friendly names (e.g. "Work Desk Tablet", "Galaxy A55") persisted in `~/.config/uscreen/config.toml` with seamless fallback to ADB `ro.product.model`.
+- **Modernized "Device" Semantics**: Replaced all rigid "Tablet" terminology across UI strings, tooltips, and status indicators with generic "Device" phrasing to represent phones, foldables, and external display receivers accurately.
+- **Persistent Bottom Bar**: Floating action bar pinned at the bottom of the window hosting real-time daemon status indicators, config path, and instant "Discard" and "Apply & restart" triggers that never scroll away.
+- **Dynamic Bitstream Negotiation**: Updated `host/src/input.rs` WebSocket handshakes to report the exact bitstream format (`"hevc"` or `"h264"`) active on that specific device's pipeline.
+- **Strict Fallback & Schema Resilience**: Non-overridden device settings dynamically inherit global values (`unwrap_or(cfg.val)`). Persisted entries use `#[serde(alias = "devices")]` to maintain 100% backwards compatibility with existing configuration files.
 
 ### 2.3 Opt-In Android Immersive Mode
 - **Edge-to-Edge Virtual Display**: Android client supports rendering across the entire physical panel, hiding navigation and status bars (`WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE`).
@@ -117,13 +131,14 @@ Comprehensive documentation, experimental benchmarks, raw unedited kernel traces
 | [`17_latency_micro_optimization.md`](file:///home/harsh/Documents/GITHUB%20PROJECTS/UScreen/experiments_and_findings/17_latency_micro_optimization.md) | End-to-End Latency Breakdown via Monotonic Shared-Memory Ring Buffer |
 | [`18_hevc_low_latency_tuning.md`](file:///home/harsh/Documents/GITHUB%20PROJECTS/UScreen/experiments_and_findings/18_hevc_low_latency_tuning.md) | Advanced HEVC Low-Latency Optimization & Exynos Deadlock Resolution |
 | [`19_per_device_encoder_overrides.md`](file:///home/harsh/Documents/GITHUB%20PROJECTS/UScreen/experiments_and_findings/19_per_device_encoder_overrides.md) | Per-Device Hardware Encoder Overrides & Multi-Device Topologies |
+| [`20_multi_device_ux_redesign.md`](file:///home/harsh/Documents/GITHUB%20PROJECTS/UScreen/experiments_and_findings/20_multi_device_ux_redesign.md) | Architectural Multi-Device UX Overhaul, Sidebar Navigation & Full Overrides |
 
 ---
 
 ## 6. Verification Checklist
 
-- [x] **Backend Unit Tests**: All 39 test cases in `cargo test` pass with 0 errors.
-- [x] **GUI Compilation**: Built cleanly under release mode and verified with native Wayland/X11 rendering.
-- [x] **Empirical Process Routing**: Verified via `ps aux | grep ffmpeg` and `journalctl` that per-device overrides invoke `hevc_vaapi` while non-overridden devices simultaneously invoke `h264_vaapi`.
+- [x] **Backend Unit Tests**: All 41 test cases in `cargo test --workspace` pass with 0 errors.
+- [x] **GUI Compilation**: Built cleanly under release mode and verified with native Wayland/X11 rendering without runtime panics.
+- [x] **Empirical Process Routing**: Verified via `ps aux | grep -E "evdi_helper|ffmpeg"` that Device A (`R52X708AEHK`) runs `hevc_vaapi` at 30 FPS on EVDI card 2 while Device B (`RZCX809Y0FT`) simultaneously runs `h264_vaapi` at 90 FPS on EVDI card 0.
 - [x] **Android Client Validation**: Compiled and tested across Android 12, 13, and 14 with hardware HEVC and H.264 decoders.
 - [x] **End-to-End Latency**: Median encode-to-display latency clocked at **~19.8ms - 20.8ms** with wire transmission at **~4.0ms**.

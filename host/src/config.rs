@@ -29,37 +29,57 @@ pub const DEFAULT_QUALITY: u32 = 18;
 pub const MIN_QUALITY: u32 = 12;
 pub const MAX_QUALITY: u32 = 32;
 
-/// What one tablet reported about itself, and anything set specifically for
+/// What one device reported about itself, and anything set specifically for
 /// it, keyed in the config by its adb serial.
-///
-/// Two tablets are rarely the same size, and the panel size goes into the
-/// EDID, so without this the daemon starts every session with whatever the
-/// last tablet was and rebuilds the display as soon as this one says what it
-/// really is — several helper restarts and, on a slow machine, half a minute
-/// before the first picture. Remembering per serial builds the right display
-/// first time, and is the natural place to hang per-tablet settings.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 #[serde(default)]
 pub struct TabletProfile {
-    /// Model name, so the file reads sensibly to a human.
+    /// Inferred model name (e.g. from ro.product.model).
     pub label: String,
+    /// User-customized nickname for the device.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
     pub width: u32,
     pub height: u32,
     /// Panel size in millimetres; feeds the EDID and so the desktop's scale.
     pub width_mm: u32,
     pub height_mm: u32,
-    /// Set only where this tablet should differ from the global settings.
+    /// Set only where this device should differ from the global settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bitrate: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quality: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_scale: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encoder: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ten_bit: Option<bool>,
 }
 
+#[allow(dead_code)]
+pub type DeviceProfile = TabletProfile;
+
 impl TabletProfile {
-    /// Whether this tablet's own dimensions are known.
+    /// Friendly display name: nickname if provided, else model label, else fallback.
+    pub fn display_name<'a>(&'a self, fallback: &'a str) -> &'a str {
+        if let Some(ref n) = self.nickname {
+            let trimmed = n.trim();
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+        if !self.label.trim().is_empty() {
+            return self.label.trim();
+        }
+        fallback
+    }
+
+    /// Whether this device's own dimensions are known.
     pub fn has_display(&self) -> bool {
         self.width > 0 && self.height > 0
     }
@@ -129,8 +149,9 @@ pub struct FileConfig {
     /// that is NVIDIA's (which cannot encode through VAAPI) a perfectly good
     /// Intel or AMD encoder next to it went unused.
     pub vaapi_device: String,
-    /// Remembered per tablet, keyed by adb serial. Written when a tablet
-    /// reports its panel, read the next time that tablet is plugged in.
+    /// Remembered per device, keyed by adb serial. Written when a device
+    /// reports its panel, read the next time that device is plugged in.
+    #[serde(alias = "devices")]
     pub tablets: std::collections::HashMap<String, TabletProfile>,
     /// Leave an ordinary mouse cursor where the pen was lifted. A tablet
     /// tool's cursor disappears when it leaves proximity, which loses the
@@ -335,5 +356,65 @@ height = 1080
         let re_parsed: FileConfig = toml::from_str(&serialized).expect("re-parse");
         assert_eq!(re_parsed.tablets.get("DEVICE_B").unwrap().encoder, None);
         assert_eq!(re_parsed.tablets.get("DEVICE_A").unwrap().encoder.as_deref(), Some("hevc_vaapi"));
+    }
+
+    #[test]
+    fn device_profile_overrides_and_nickname_serialization() {
+        let toml_data = r#"
+encoder = "h264_vaapi"
+fps = 60
+quality = 18
+bitrate = 20000
+
+[tablets.R52X708AEHK]
+label = "SM-X616B"
+nickname = "My Desk Tablet"
+width = 2560
+height = 1600
+fps = 30
+quality = 16
+bitrate = 35000
+encoder = "hevc_vaapi"
+ten_bit = true
+stream_scale = 1
+position = "left"
+"#;
+
+        let cfg: FileConfig = toml::from_str(toml_data).expect("parse config");
+        let profile = cfg.tablets.get("R52X708AEHK").expect("profile exists");
+        assert_eq!(profile.display_name("R52X708AEHK"), "My Desk Tablet");
+        assert_eq!(profile.nickname.as_deref(), Some("My Desk Tablet"));
+        assert_eq!(profile.fps, Some(30));
+        assert_eq!(profile.quality, Some(16));
+        assert_eq!(profile.bitrate, Some(35000));
+        assert_eq!(profile.encoder.as_deref(), Some("hevc_vaapi"));
+        assert_eq!(profile.ten_bit, Some(true));
+        assert_eq!(profile.stream_scale, Some(1));
+        assert_eq!(profile.position.as_deref(), Some("left"));
+
+        let serialized = toml::to_string_pretty(&cfg).expect("serialize");
+        assert!(serialized.contains("nickname = \"My Desk Tablet\""));
+        assert!(serialized.contains("ten_bit = true"));
+        assert!(serialized.contains("fps = 30"));
+
+        let reparsed: FileConfig = toml::from_str(&serialized).expect("reparse");
+        let p2 = reparsed.tablets.get("R52X708AEHK").unwrap();
+        assert_eq!(p2.nickname.as_deref(), Some("My Desk Tablet"));
+        assert_eq!(p2.ten_bit, Some(true));
+    }
+
+    #[test]
+    fn device_profile_display_name_fallback_hierarchy() {
+        let mut p = TabletProfile::default();
+        assert_eq!(p.display_name("fallback_serial"), "fallback_serial");
+
+        p.label = "SM-X616B".to_string();
+        assert_eq!(p.display_name("fallback_serial"), "SM-X616B");
+
+        p.nickname = Some("  ".to_string());
+        assert_eq!(p.display_name("fallback_serial"), "SM-X616B");
+
+        p.nickname = Some("Samsung Tab S9 FE".to_string());
+        assert_eq!(p.display_name("fallback_serial"), "Samsung Tab S9 FE");
     }
 }

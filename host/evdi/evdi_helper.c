@@ -94,7 +94,10 @@ static volatile int g_buffers_ready = 0;
    still cutting idle work by an order of magnitude.
    The real fix is requesting an IDR on demand, which needs the in-process
    encoder rather than a pipe into the ffmpeg CLI. */
-#define IDLE_KEEPALIVE_MS 200
+/* At 33ms (~30fps) the idle floor keeps the encoder and the client's read
+   timeout smoothly paced without freezing, while identical frames consume
+   negligible bitrate in hardware encoders via skip macroblocks. */
+#define IDLE_KEEPALIVE_MS 33
 static long long g_last_write_ms = 0;
 
 static long long now_us(void);
@@ -925,18 +928,10 @@ static void run_event_loop(evdi_handle handle) {
         if (!g_have_mode) {
             timeout_ms = 100;
         } else if (g_update_pending) {
-            /* Waiting for update_ready. The capture deadline below has already
-               passed and cannot advance until the request completes, so
-               deriving a timeout from it yields 0 forever and poll returns
-               instantly — the loop then burns a whole core. This is not a
-               rare state: disabling the virtual output leaves a mode set with
-               nothing rendering to it, which is exactly what happens when the
-               tablet is unplugged or switched to pen-only.
-               Sleep until the watchdog is due instead. update_ready wakes poll
-               the moment it arrives, so nothing is delayed when the
-               compositor is actually running. */
-            long long left = g_last_request_ms + 250 - now_ms();
-            timeout_ms = left < 0 ? 0 : (left > 250 ? 250 : (int)left);
+            /* Waiting for update_ready from the compositor. When the screen
+               is idle (e.g. mouse on primary display), Mutter commits no frames.
+               Wait cleanly on the event fd instead of timing out and force-grabbing. */
+            timeout_ms = 50;
         } else {
             long long due = g_last_request_ms + request_period_ms;
             timeout_ms = (int)(due - now_ms());
@@ -975,19 +970,11 @@ static void run_event_loop(evdi_handle handle) {
             }
         }
 
-        /* Watchdog: if a request got lost (compositor hiccup), don't stay
-           stuck waiting for update_ready forever. */
-        if (g_update_pending && (now - g_last_request_ms) > 250) {
-            g_update_pending = 0;
-            grab_now();
-        }
-
-        /* Fallback grab once a second in case no events flow at all */
-        if ((now - last_fallback_grab_ms) >= 1000) {
-            last_fallback_grab_ms = now;
-            if (!g_update_pending)
-                grab_now();
-        }
+        /* Note: When g_update_pending is true, do NOT call grab_now() or
+           evdi_request_update(). Calling evdi_grab_pixels without update_ready
+           or requesting while already requested corrupts the EVDI driver state,
+           flooding the kernel log and causing Mutter compositor mutex stalls.
+           The kernel driver will fire update_ready as soon as the compositor commits. */
 
         if (now - last_stats_ms >= 5000) {
             double elapsed = (now - last_stats_ms) / 1000.0;
@@ -1151,6 +1138,7 @@ int main(int argc, char *argv[]) {
     }
     g_device_index = dev_idx;
     g_handle = handle;
+    evdi_enable_cursor_events(handle, false);
 
     FILE *f = fopen(edid_path, "rb");
     if (!f) {

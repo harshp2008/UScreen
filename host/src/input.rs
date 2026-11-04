@@ -952,9 +952,8 @@ async fn map_and_note_area(
     let output = map_devices_to_output(pen_only, ident, card).await;
     let area = match output.as_deref() {
         Some(o) if crate::hyprland::active() => crate::hyprland::output_area(o).await,
-        // Mapped to the output itself (xinput) or left to the desktop
-        // (GNOME): the pen's own coordinates are already the right ones.
-        Some(_) if crate::gnome::active() || crate::x11::active() => None,
+        Some(o) if crate::gnome::active() => crate::gnome::output_area(o).await,
+        Some(_) if crate::x11::active() => None,
         Some(o) => output_area_on_desktop(o).await,
         None => None,
     };

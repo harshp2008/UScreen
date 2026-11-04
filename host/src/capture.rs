@@ -838,17 +838,17 @@ impl CaptureManager {
         ]);
 
         if encoder == "h264_vaapi" || encoder == "hevc_vaapi" {
-            encoder_args.extend_from_slice(&[
-                "-vf".into(),
-                "format=nv12,hwupload".into(),
-            ]);
-        }
-
-        // The FIFO carries 8-bit NV12, so 10-bit encoding needs a conversion
-        // first. Done here rather than in the helper to keep the FIFO format
-        // single: the helper stays the one thing that never has to know which
-        // codec is in use.
-        if ten_bit {
+            let vf = if ten_bit && encoder == "hevc_vaapi" {
+                "format=p010le,hwupload"
+            } else {
+                "format=nv12,hwupload"
+            };
+            encoder_args.extend_from_slice(&["-vf".into(), vf.into()]);
+        } else if ten_bit {
+            // The FIFO carries 8-bit NV12, so 10-bit encoding needs a conversion
+            // first. Done here rather than in the helper to keep the FIFO format
+            // single: the helper stays the one thing that never has to know which
+            // codec is in use.
             encoder_args.extend_from_slice(&["-vf".into(), "format=p010le".into()]);
         }
 
@@ -926,6 +926,12 @@ impl CaptureManager {
                 "-idr_interval".into(),
                 "1".into(),
             ]);
+            if ten_bit && encoder == "hevc_vaapi" {
+                encoder_args.extend_from_slice(&[
+                    "-profile:v".into(),
+                    "main10".into(),
+                ]);
+            }
         } else if encoder == "libx264" {
             let bufsize_k = (bitrate * 2 / fps.max(1)).max(200);
             encoder_args.extend_from_slice(&[

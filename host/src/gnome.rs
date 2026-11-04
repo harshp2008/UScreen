@@ -70,6 +70,71 @@ async fn monitors() -> Option<Vec<[String; 4]>> {
     parse_monitors(&json)
 }
 
+/// Where `connector` sits on the desktop, as fractions of the whole desktop:
+/// `(x, y, width, height)`. Used for the plain pointer device on GNOME Wayland.
+pub async fn output_area(connector: &str) -> Option<(f64, f64, f64, f64)> {
+    let json = output_of(
+        "busctl",
+        &[
+            "--user",
+            "--json=short",
+            "call",
+            "org.gnome.Mutter.DisplayConfig",
+            "/org/gnome/Mutter/DisplayConfig",
+            "org.gnome.Mutter.DisplayConfig",
+            "GetCurrentState",
+        ],
+    )
+    .await?;
+    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+    let data = v.get("data")?.as_array()?;
+    let monitors_arr = data.get(1)?.as_array()?;
+    let logical_arr = data.get(2)?.as_array()?;
+
+    // Map connector -> (physical_w, physical_h)
+    let mut phys_sizes = std::collections::HashMap::new();
+    for m in monitors_arr {
+        let conn = m.get(0)?.get(0)?.as_str()?;
+        let modes = m.get(1)?.as_array()?;
+        for mode in modes {
+            let mode_arr = mode.as_array()?;
+            let w = mode_arr.get(1)?.as_f64()?;
+            let h = mode_arr.get(2)?.as_f64()?;
+            let is_cur = mode_arr
+                .get(6)
+                .and_then(|p| p.get("is-current"))
+                .and_then(|c| c.get("data").or(Some(c)))
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            if is_cur || modes.len() == 1 {
+                phys_sizes.insert(conn, (w, h));
+                break;
+            }
+        }
+    }
+
+    let mut mine = None;
+    let (mut max_x, mut max_y) = (0.0f64, 0.0f64);
+    for lm in logical_arr {
+        let lm_arr = lm.as_array()?;
+        let x = lm_arr.get(0)?.as_f64()?;
+        let y = lm_arr.get(1)?.as_f64()?;
+        let scale = lm_arr.get(2)?.as_f64().unwrap_or(1.0).max(0.01);
+        let conn = lm_arr.get(5)?.get(0)?.get(0)?.as_str()?;
+        let (pw, ph) = phys_sizes.get(conn).copied().unwrap_or((1920.0, 1080.0));
+        let w = pw / scale;
+        let h = ph / scale;
+        max_x = max_x.max(x + w);
+        max_y = max_y.max(y + h);
+        if conn == connector {
+            mine = Some((x, y, w, h));
+        }
+    }
+
+    let (x, y, w, h) = mine?;
+    (max_x > 0.0 && max_y > 0.0).then(|| (x / max_x, y / max_y, w / max_x, h / max_y))
+}
+
 #[derive(Clone, Copy)]
 enum Kind {
     Tablet,

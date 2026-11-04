@@ -573,7 +573,8 @@ impl eframe::App for App {
                         .selected_text(match self.cfg.encoder.as_str() {
                             "h264_nvenc" => "NVIDIA H.264 (NVENC)",
                             "hevc_nvenc" => "NVIDIA HEVC (NVENC)",
-                            "h264_vaapi" | "vaapih264enc" => "AMD / Intel (VAAPI)",
+                            "h264_vaapi" | "vaapih264enc" => "AMD / Intel H.264 (VAAPI)",
+                            "hevc_vaapi" => "AMD / Intel HEVC (VAAPI)",
                             "libx264" => "CPU (libx264)",
                             other => other,
                         })
@@ -591,7 +592,12 @@ impl eframe::App for App {
                             ui.selectable_value(
                                 &mut self.cfg.encoder,
                                 "h264_vaapi".to_string(),
-                                "AMD / Intel (VAAPI)",
+                                "AMD / Intel H.264 (VAAPI)",
+                            );
+                            ui.selectable_value(
+                                &mut self.cfg.encoder,
+                                "hevc_vaapi".to_string(),
+                                "AMD / Intel HEVC (VAAPI)",
                             );
                             ui.selectable_value(
                                 &mut self.cfg.encoder,

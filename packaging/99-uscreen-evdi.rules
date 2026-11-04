@@ -1,0 +1,3 @@
+# Assign user seat access to EVDI DRM virtual devices so unprivileged users
+# (and Mutter Wayland sessions) can access the DRM card nodes without root.
+ACTION=="add", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DRIVERS=="evdi", TAG+="uaccess"

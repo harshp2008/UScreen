@@ -14,6 +14,7 @@ mod latency;
 mod osk;
 mod runtime;
 mod stream;
+pub mod timing;
 mod tray;
 mod update;
 mod vdisplay;
@@ -83,6 +84,10 @@ struct Cli {
 
     #[arg(long = "input-port")]
     input_port: Option<u16>,
+
+    /// Force 60 FPS stream on performance power profile
+    #[arg(long = "max-performance")]
+    max_performance: bool,
 }
 
 #[derive(Subcommand)]
@@ -233,6 +238,7 @@ async fn run_daemon(cli: Cli) -> Result<()> {
     let quality = cli.quality.unwrap_or(file_cfg.quality);
     let stream_scale = cli.stream_scale.unwrap_or(file_cfg.stream_scale);
     let pen_only = cli.pen_only || file_cfg.pen_only;
+    let max_performance_mode = cli.max_performance || file_cfg.max_performance_mode;
 
     let cap_config = capture::CaptureConfig {
         helper_path: find_helper(&cli.helper),
@@ -253,6 +259,8 @@ async fn run_daemon(cli: Cli) -> Result<()> {
         // With several tablets every helper is pinned to its own card; the
         // helper's own search would give each of them the same one.
         card: if file_cfg.max_tablets > 1 { vdisplay::evdi_cards().into_iter().min() } else { None },
+        max_performance_mode,
+        hevc_low_latency_tuning: file_cfg.hevc_low_latency_tuning,
     };
 
     // One secret per daemon run. Handed to the app over adb when it is
@@ -428,7 +436,15 @@ async fn run_daemon(cli: Cli) -> Result<()> {
         while settings_rx_save.changed().await.is_ok() {
             let s = settings_rx_save.borrow().clone();
             let mut cfg = config::FileConfig::load();
-            if !cli_overrides.0 { cfg.encoder = s.encoder; }
+            let has_device_encoder = serial_rx_save
+                .borrow()
+                .as_ref()
+                .and_then(|serial| cfg.tablets.get(serial))
+                .and_then(|p| p.encoder.as_ref())
+                .is_some();
+            if !cli_overrides.0 && !has_device_encoder {
+                cfg.encoder = s.encoder;
+            }
             if !cli_overrides.1 { cfg.fps = s.fps; }
             if !cli_overrides.2 { cfg.bitrate = s.bitrate; }
             if !cli_overrides.3 { cfg.width = s.width; }
@@ -511,10 +527,11 @@ async fn run_daemon(cli: Cli) -> Result<()> {
             ten_bit: file_cfg.ten_bit,
             instance: 0,
             card: None,
+            max_performance_mode,
+            hevc_low_latency_tuning: file_cfg.hevc_low_latency_tuning,
         },
         video_port,
         input_port,
-        codec: capture::Codec::from_encoder(&encoder).muxer().to_string(),
         token: token.clone(),
         mode_tx: mode_tx.clone(),
         shutdown_rx: shutdown_tx.subscribe(),
@@ -727,7 +744,6 @@ struct ExtraSessionTemplate {
     cap_template: capture::CaptureConfig,
     video_port: u16,
     input_port: u16,
-    codec: String,
     token: Option<String>,
     mode_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
@@ -763,10 +779,20 @@ impl ExtraSession {
 /// Bring up capture, stream and input for tablet number `instance`.
 /// Ports are the base ports plus 2 per instance; the tablet side keeps
 /// using 8890/8891, since `adb reverse` maps them per device.
-fn spawn_extra_session(t: &ExtraSessionTemplate, instance: u32) -> Option<ExtraSession> {
+fn spawn_extra_session(t: &ExtraSessionTemplate, instance: u32, serial: &str) -> Option<ExtraSession> {
     let cards = vdisplay::evdi_cards();
     let mut cfg = t.cap_template.clone();
     cfg.instance = instance;
+    // Check if this tablet has an encoder override configured
+    let file_cfg = config::FileConfig::load();
+    if let Some(p) = file_cfg.tablets.get(serial) {
+        if let Some(ref enc) = p.encoder {
+            if !enc.trim().is_empty() {
+                cfg.encoder = enc.clone();
+            }
+        }
+    }
+    let codec = capture::Codec::from_encoder(&cfg.encoder).muxer().to_string();
     // Each tablet owns one EVDI card, by slot. Starting a session without one
     // used to leave its helper to find a free card by itself, which with
     // several starting at once means two helpers on the same card and two
@@ -814,7 +840,7 @@ fn spawn_extra_session(t: &ExtraSessionTemplate, instance: u32) -> Option<ExtraS
             port: input_port,
             instance,
             token: t.token.clone(),
-            codec: t.codec.clone(),
+            codec,
             virtual_width: cfg.width,
             virtual_height: cfg.height,
             pointer_handoff: config::FileConfig::load().pointer_handoff,
@@ -1028,7 +1054,7 @@ async fn adb_monitor(
                     continue;
                 };
                 info!("Tablet {} connected over {} ({})", instance + 1, transport_of(&serial).label(), serial);
-                let Some(sess) = spawn_extra_session(&extra, instance) else {
+                let Some(sess) = spawn_extra_session(&extra, instance, &serial) else {
                     continue;
                 };
                 apply_tablet_profile(&serial, &sess.settings_tx).await;
@@ -1284,29 +1310,59 @@ async fn apply_tablet_profile(serial: &str, settings_tx: &watch::Sender<capture:
         }
         return;
     };
-    if !p.has_display() {
-        return;
-    }
     let mut s = settings_tx.borrow().clone();
-    let before = (s.width, s.height, s.width_mm, s.height_mm, s.fps, s.bitrate, s.quality, s.stream_scale);
-    s.width = p.width;
-    s.height = p.height;
-    if p.width_mm > 0 && p.height_mm > 0 {
-        s.width_mm = p.width_mm;
-        s.height_mm = p.height_mm;
+    let before = (
+        s.width,
+        s.height,
+        s.width_mm,
+        s.height_mm,
+        s.fps,
+        s.bitrate,
+        s.quality,
+        s.stream_scale,
+        s.encoder.clone(),
+    );
+    if p.has_display() {
+        s.width = p.width;
+        s.height = p.height;
+        if p.width_mm > 0 && p.height_mm > 0 {
+            s.width_mm = p.width_mm;
+            s.height_mm = p.height_mm;
+        }
     }
     if let Some(v) = p.fps { s.fps = v; }
     if let Some(v) = p.bitrate { s.bitrate = v; }
     if let Some(v) = p.quality { s.quality = v; }
     if let Some(v) = p.stream_scale { s.stream_scale = v.max(1); }
-    if before == (s.width, s.height, s.width_mm, s.height_mm, s.fps, s.bitrate, s.quality, s.stream_scale) {
+    if let Some(ref enc) = p.encoder {
+        if !enc.trim().is_empty() {
+            s.encoder = enc.clone();
+        } else {
+            s.encoder = cfg.encoder.clone();
+        }
+    } else {
+        s.encoder = cfg.encoder.clone();
+    }
+    if before == (
+        s.width,
+        s.height,
+        s.width_mm,
+        s.height_mm,
+        s.fps,
+        s.bitrate,
+        s.quality,
+        s.stream_scale,
+        s.encoder.clone(),
+    ) {
         return;
     }
     info!(
-        "Known tablet {}{}: {}x{} ({}x{} mm) — building the display for it straight away",
+        "Tablet profile applied for {}{}: {}x{} ({}x{} mm), encoder: {} ({})",
         serial,
         if p.label.is_empty() { String::new() } else { format!(" ({})", p.label) },
-        s.width, s.height, s.width_mm, s.height_mm
+        s.width, s.height, s.width_mm, s.height_mm,
+        s.encoder,
+        if p.encoder.is_some() { "device override" } else { "global default" }
     );
     let _ = settings_tx.send(s);
 }

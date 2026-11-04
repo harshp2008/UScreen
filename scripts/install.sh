@@ -190,8 +190,8 @@ system_setup() {
     # Neither directory is guaranteed to exist on a minimal install, and with
     # set -e a missing one used to kill the whole script here, silently, with
     # the binaries already copied and the udev rule not yet installed.
-    sudo mkdir -p /etc/modprobe.d /etc/modules-load.d
-    echo "options evdi initial_device_count=2" | sudo tee /etc/modprobe.d/uscreen-evdi.conf >/dev/null \
+    sudo mkdir -p /etc/modprobe.d /etc/modules-load.d /etc/udev/rules.d
+    printf "options evdi initial_device_count=2\nsoftdep evdi pre: drm_kms_helper i915\n" | sudo tee /etc/modprobe.d/uscreen-evdi.conf >/dev/null \
         || warn "Could not write /etc/modprobe.d/uscreen-evdi.conf"
     printf "evdi\nuinput\n" | sudo tee /etc/modules-load.d/uscreen.conf >/dev/null \
         || warn "Could not write /etc/modules-load.d/uscreen.conf"
@@ -205,6 +205,16 @@ system_setup() {
             sudo udevadm trigger --name-match=uinput 2>/dev/null || true
         else
             warn "packaging/60-uscreen-uinput.rules not found — /dev/uinput may stay root-only"
+        fi
+    fi
+
+    # EVDI DRM device uaccess rule: ensures /dev/dri/card* nodes created by evdi
+    # receive user seat permissions without race conditions.
+    if [ ! -e /etc/udev/rules.d/99-uscreen-evdi.rules ] && [ ! -e /usr/lib/udev/rules.d/99-uscreen-evdi.rules ]; then
+        if [ -f "$PROJECT_DIR/packaging/99-uscreen-evdi.rules" ]; then
+            sudo install -Dm644 "$PROJECT_DIR/packaging/99-uscreen-evdi.rules" /etc/udev/rules.d/99-uscreen-evdi.rules
+            sudo udevadm control --reload 2>/dev/null || true
+            sudo udevadm trigger 2>/dev/null || true
         fi
     fi
 

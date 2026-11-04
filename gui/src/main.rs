@@ -7,6 +7,31 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// What one tablet reported about itself and per-device overrides.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+struct TabletProfile {
+    pub label: String,
+    pub width: u32,
+    pub height: u32,
+    pub width_mm: u32,
+    pub height_mm: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitrate: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_scale: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoder: Option<String>,
+    #[serde(flatten)]
+    pub extra: toml::value::Table,
+}
+
 /// Mirror of the daemon's config file (~/.config/uscreen/config.toml).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
@@ -34,16 +59,17 @@ struct FileConfig {
     wifi_address: String,
     /// Mirrors the daemon's field; see the rule above about unknown fields.
     vaapi_device: String,
-    /// Per-tablet profiles. The GUI does not edit them, but it rewrites the
-    /// whole file, so a field it does not know is a field it deletes.
+    /// Per-tablet profiles and per-device overrides.
     #[serde(default)]
-    tablets: toml::value::Table,
+    tablets: std::collections::HashMap<String, TabletProfile>,
     /// Mirrors the daemon's field; see the rule above about unknown fields.
     pointer_handoff: bool,
     auto_resolution: bool,
     video_port: u16,
     input_port: u16,
     auto_launch_app: bool,
+    max_performance_mode: bool,
+    hevc_low_latency_tuning: bool,
 }
 
 impl Default for FileConfig {
@@ -64,12 +90,14 @@ impl Default for FileConfig {
             max_tablets: 1,
             wifi_address: String::new(),
             vaapi_device: String::new(),
-            tablets: toml::value::Table::new(),
+            tablets: std::collections::HashMap::new(),
             pointer_handoff: true,
             auto_resolution: true,
             video_port: 8890,
             input_port: 8891,
             auto_launch_app: true,
+            max_performance_mode: false,
+            hevc_low_latency_tuning: true,
         }
     }
 }
@@ -137,12 +165,20 @@ fn set_autostart(on: bool) -> Result<(), String> {
     }
 }
 
+#[derive(Default, Clone, PartialEq, Eq)]
+struct ConnectedTablet {
+    serial: String,
+    model: String,
+    transport: String,
+}
+
 #[derive(Default, Clone)]
 struct Status {
     daemon_running: bool,
     daemon_pid: u32,
     tablet_connected: bool,
     tablet_model: String,
+    connected_tablets: Vec<ConnectedTablet>,
     /// -1 = evdi module not loaded, otherwise the device count
     evdi_count: i32,
     ffmpeg_ok: bool,
@@ -217,15 +253,46 @@ fn poll_status() -> Status {
             .skip(1)
             .filter(|l| l.split_whitespace().nth(1) == Some("device"))
             .collect();
-        // Prefer the USB entry (no colon in the serial), like the daemon does.
-        if let Some(line) = ready
-            .iter()
-            .find(|l| !l.split_whitespace().next().unwrap_or("").contains(':'))
-            .or(ready.first())
-        {
+        for line in &ready {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            let serial = parts.first().copied().unwrap_or("").to_string();
+            if serial.is_empty() {
+                continue;
+            }
+            let model = parts
+                .iter()
+                .find_map(|t| t.strip_prefix("model:"))
+                .map(|m| m.replace('_', " "))
+                .unwrap_or_else(|| serial.clone());
+            let transport = if serial.contains(':') || serial.contains("._adb") {
+                "Wi-Fi".to_string()
+            } else {
+                "USB".to_string()
+            };
+            s.connected_tablets.push(ConnectedTablet {
+                serial,
+                model,
+                transport,
+            });
+        }
+        if let Some(first) = s.connected_tablets.first() {
             s.tablet_connected = true;
-            if let Some(model) = line.split_whitespace().find_map(|t| t.strip_prefix("model:")) {
-                s.tablet_model = model.replace('_', " ");
+            s.tablet_model = first.model.clone();
+        }
+    }
+    if let Ok(fakes) = std::env::var("USCREEN_FAKE_TABLET") {
+        for fake in fakes.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+            if !s.connected_tablets.iter().any(|t| t.serial == fake) {
+                let model = format!("Emulated Device ({})", fake);
+                s.connected_tablets.push(ConnectedTablet {
+                    serial: fake.to_string(),
+                    model: model.clone(),
+                    transport: "Emulated".to_string(),
+                });
+                s.tablet_connected = true;
+                if s.tablet_model.is_empty() {
+                    s.tablet_model = model;
+                }
             }
         }
     }
@@ -388,6 +455,17 @@ impl App {
     }
 }
 
+fn encoder_label(enc: &str) -> &'static str {
+    match enc {
+        "h264_nvenc" => "NVIDIA H.264 (NVENC)",
+        "hevc_nvenc" => "NVIDIA HEVC (NVENC)",
+        "h264_vaapi" | "vaapih264enc" => "AMD / Intel H.264 (VAAPI)",
+        "hevc_vaapi" => "AMD / Intel HEVC (VAAPI)",
+        "libx264" => "CPU (libx264)",
+        _ => "Custom",
+    }
+}
+
 fn scale_label(n: u32) -> &'static str {
     match n {
         3 => "Third — very soft",
@@ -512,13 +590,13 @@ impl eframe::App for App {
                         },
                     );
                     ui.add_space(4.0);
-                    status_dot(
-                        ui,
-                        status.tablet_connected,
-                        if status.tablet_connected { "Tablet connected" } else { "No tablet detected" },
-                        &status.tablet_model,
-                    );
-                    if !status.tablet_connected {
+                    if status.connected_tablets.is_empty() {
+                        status_dot(
+                            ui,
+                            false,
+                            "No tablet detected",
+                            "",
+                        );
                         ui.add_space(4.0);
                         ui.label(
                             egui::RichText::new(
@@ -527,6 +605,29 @@ impl eframe::App for App {
                             .weak()
                             .size(11.0),
                         );
+                    } else if status.connected_tablets.len() == 1 {
+                        let t = &status.connected_tablets[0];
+                        status_dot(
+                            ui,
+                            true,
+                            "Tablet connected",
+                            &format!("{} ({})", t.model, t.transport),
+                        );
+                    } else {
+                        status_dot(
+                            ui,
+                            true,
+                            &format!("{} Tablets connected", status.connected_tablets.len()),
+                            "",
+                        );
+                        ui.add_space(2.0);
+                        for (idx, t) in status.connected_tablets.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.add_space(14.0);
+                                ui.label(egui::RichText::new(format!("{}. {} ({})", idx + 1, t.model, t.transport)).size(12.0));
+                                ui.label(egui::RichText::new(&t.serial).weak().size(11.0));
+                            });
+                        }
                     }
                 });
 
@@ -568,12 +669,13 @@ impl eframe::App for App {
                 .num_columns(2)
                 .spacing([16.0, 10.0])
                 .show(ui, |ui| {
-                    ui.label("Encoder");
+                    ui.label("Global Encoder");
                     egui::ComboBox::from_id_salt("encoder")
                         .selected_text(match self.cfg.encoder.as_str() {
                             "h264_nvenc" => "NVIDIA H.264 (NVENC)",
                             "hevc_nvenc" => "NVIDIA HEVC (NVENC)",
-                            "h264_vaapi" | "vaapih264enc" => "AMD / Intel (VAAPI)",
+                            "h264_vaapi" | "vaapih264enc" => "AMD / Intel H.264 (VAAPI)",
+                            "hevc_vaapi" => "AMD / Intel HEVC (VAAPI)",
                             "libx264" => "CPU (libx264)",
                             other => other,
                         })
@@ -591,7 +693,12 @@ impl eframe::App for App {
                             ui.selectable_value(
                                 &mut self.cfg.encoder,
                                 "h264_vaapi".to_string(),
-                                "AMD / Intel (VAAPI)",
+                                "AMD / Intel H.264 (VAAPI)",
+                            );
+                            ui.selectable_value(
+                                &mut self.cfg.encoder,
+                                "hevc_vaapi".to_string(),
+                                "AMD / Intel HEVC (VAAPI)",
                             );
                             ui.selectable_value(
                                 &mut self.cfg.encoder,
@@ -599,6 +706,91 @@ impl eframe::App for App {
                                 "CPU (libx264)",
                             );
                         });
+                    ui.end_row();
+
+                    // Per-device encoder overrides
+                    let mut devices_to_show: Vec<(String, String, bool)> = Vec::new();
+                    for t in &status.connected_tablets {
+                        devices_to_show.push((t.serial.clone(), t.model.clone(), true));
+                    }
+                    for (serial, profile) in &self.cfg.tablets {
+                        if !devices_to_show.iter().any(|(s, _, _)| s == serial) {
+                            let label = if profile.label.is_empty() {
+                                serial.clone()
+                            } else {
+                                profile.label.clone()
+                            };
+                            devices_to_show.push((serial.clone(), label, false));
+                        }
+                    }
+
+                    ui.label("Device Encoders");
+                    ui.vertical(|ui| {
+                        if devices_to_show.is_empty() {
+                            ui.label(egui::RichText::new("No tablets detected").weak().size(11.0));
+                        } else {
+                            for (serial, model, is_connected) in devices_to_show {
+                                let current_override = self.cfg.tablets.get(&serial).and_then(|p| p.encoder.clone());
+                                let selected_text = match current_override.as_deref() {
+                                    None => format!("Follow Global ({})", encoder_label(&self.cfg.encoder)),
+                                    Some("h264_nvenc") => "NVIDIA H.264 (NVENC)".to_string(),
+                                    Some("hevc_nvenc") => "NVIDIA HEVC (NVENC)".to_string(),
+                                    Some("h264_vaapi") | Some("vaapih264enc") => "AMD / Intel H.264 (VAAPI)".to_string(),
+                                    Some("hevc_vaapi") => "AMD / Intel HEVC (VAAPI)".to_string(),
+                                    Some("libx264") => "CPU (libx264)".to_string(),
+                                    Some(other) => other.to_string(),
+                                };
+
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(&model).strong().size(12.0));
+                                    if is_connected {
+                                        ui.label(egui::RichText::new("●").color(egui::Color32::from_rgb(76, 175, 80)).size(10.0));
+                                    }
+                                });
+                                ui.label(egui::RichText::new(&serial).weak().size(10.0));
+
+                                let mut new_val = current_override.clone();
+                                let mut changed = false;
+                                egui::ComboBox::from_id_salt(format!("dev_enc_{}", serial))
+                                    .selected_text(&selected_text)
+                                    .show_ui(ui, |ui| {
+                                        if ui.selectable_label(new_val.is_none(), format!("Follow Global ({})", encoder_label(&self.cfg.encoder))).clicked() {
+                                            new_val = None;
+                                            changed = true;
+                                        }
+                                        if ui.selectable_label(new_val.as_deref() == Some("h264_vaapi"), "AMD / Intel H.264 (VAAPI)").clicked() {
+                                            new_val = Some("h264_vaapi".to_string());
+                                            changed = true;
+                                        }
+                                        if ui.selectable_label(new_val.as_deref() == Some("hevc_vaapi"), "AMD / Intel HEVC (VAAPI)").clicked() {
+                                            new_val = Some("hevc_vaapi".to_string());
+                                            changed = true;
+                                        }
+                                        if ui.selectable_label(new_val.as_deref() == Some("h264_nvenc"), "NVIDIA H.264 (NVENC)").clicked() {
+                                            new_val = Some("h264_nvenc".to_string());
+                                            changed = true;
+                                        }
+                                        if ui.selectable_label(new_val.as_deref() == Some("hevc_nvenc"), "NVIDIA HEVC (NVENC)").clicked() {
+                                            new_val = Some("hevc_nvenc".to_string());
+                                            changed = true;
+                                        }
+                                        if ui.selectable_label(new_val.as_deref() == Some("libx264"), "CPU (libx264)").clicked() {
+                                            new_val = Some("libx264".to_string());
+                                            changed = true;
+                                        }
+                                    });
+
+                                if changed {
+                                    let p = self.cfg.tablets.entry(serial).or_default();
+                                    p.encoder = new_val;
+                                    if p.label.is_empty() && !model.is_empty() {
+                                        p.label = model;
+                                    }
+                                }
+                                ui.add_space(4.0);
+                            }
+                        }
+                    });
                     ui.end_row();
 
                     ui.label("Quality");
@@ -827,6 +1019,19 @@ impl eframe::App for App {
                                 Err(e) => self.message = e,
                             }
                         }
+                    });
+                    ui.end_row();
+
+                    ui.label("Performance");
+                    ui.vertical(|ui| {
+                        ui.checkbox(
+                            &mut self.cfg.max_performance_mode,
+                            "Max Performance Mode (Force 60FPS on Performance Profile)",
+                        )
+                        .on_hover_text(
+                            "When system power profile is 'performance', eliminates idle FPS \
+                             throttling and forces a continuous 60FPS stream.",
+                        );
                     });
                     ui.end_row();
                 });

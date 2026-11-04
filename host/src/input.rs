@@ -952,9 +952,8 @@ async fn map_and_note_area(
     let output = map_devices_to_output(pen_only, ident, card).await;
     let area = match output.as_deref() {
         Some(o) if crate::hyprland::active() => crate::hyprland::output_area(o).await,
-        // Mapped to the output itself (xinput) or left to the desktop
-        // (GNOME): the pen's own coordinates are already the right ones.
-        Some(_) if crate::gnome::active() || crate::x11::active() => None,
+        Some(o) if crate::gnome::active() => crate::gnome::output_area(o).await,
+        Some(_) if crate::x11::active() => None,
         Some(o) => output_area_on_desktop(o).await,
         None => None,
     };
@@ -1311,10 +1310,15 @@ async fn handle_connection(
     let mut mode_rx = mode_tx.subscribe();
     // The stream settings as they are now, and a way to hear when they change.
     let mut settings_rx = settings_tx.as_ref().map(|t| t.subscribe());
+    let current_codec = |tx: &Option<watch::Sender<EncoderSettings>>, fallback: &str| -> String {
+        tx.as_ref()
+            .map(|t| crate::capture::Codec::from_encoder(&t.borrow().encoder).muxer().to_string())
+            .unwrap_or_else(|| fallback.to_string())
+    };
     let current_settings = |tx: &Option<watch::Sender<EncoderSettings>>| {
         tx.as_ref().map(|t| {
             let s = t.borrow();
-            (s.fps, s.bitrate)
+            (s.fps, s.bitrate, s.encoder.clone())
         })
     };
     let mut last_sent = current_settings(&settings_tx);
@@ -1351,10 +1355,10 @@ async fn handle_connection(
         status: "connected".to_string(),
         width: config.virtual_width,
         height: config.virtual_height,
-        codec: config.codec.clone(),
+        codec: current_codec(&settings_tx, &config.codec),
         pen_only: *mode_rx.borrow_and_update(),
-        fps: last_sent.map(|(f, _)| f),
-        bitrate_kbps: last_sent.map(|(_, b)| b),
+        fps: last_sent.as_ref().map(|(f, _, _)| *f),
+        bitrate_kbps: last_sent.as_ref().map(|(_, b, _)| *b),
     };
 
     ws_sender
@@ -1380,10 +1384,10 @@ async fn handle_connection(
                     status: "mode".to_string(),
                     width: config.virtual_width,
                     height: config.virtual_height,
-                    codec: config.codec.clone(),
+                    codec: current_codec(&settings_tx, &config.codec),
                     pen_only,
-                    fps: now.map(|(f, _)| f),
-                    bitrate_kbps: now.map(|(_, b)| b),
+                    fps: now.as_ref().map(|(f, _, _)| *f),
+                    bitrate_kbps: now.as_ref().map(|(_, b, _)| *b),
                 };
                 last_sent = now;
                 if ws_sender
@@ -1413,16 +1417,16 @@ async fn handle_connection(
                 if now == last_sent {
                     continue;
                 }
-                last_sent = now;
                 let resp = InputResponse {
                     status: "settings".to_string(),
                     width: config.virtual_width,
                     height: config.virtual_height,
-                    codec: config.codec.clone(),
+                    codec: current_codec(&settings_tx, &config.codec),
                     pen_only: *mode_rx.borrow(),
-                    fps: now.map(|(f, _)| f),
-                    bitrate_kbps: now.map(|(_, b)| b),
+                    fps: now.as_ref().map(|(f, _, _)| *f),
+                    bitrate_kbps: now.as_ref().map(|(_, b, _)| *b),
                 };
+                last_sent = now;
                 if ws_sender
                     .send(Message::Text(serde_json::to_string(&resp)?))
                     .await

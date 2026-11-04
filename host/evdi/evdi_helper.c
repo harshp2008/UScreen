@@ -18,6 +18,8 @@
    ddcci_data_handler member of evdi_event_context, so a struct one pointer
    too short was being handed to a library that reads that member. */
 #include "evdi_lib.h"
+#include <X11/Xlib.h>
+#include <X11/extensions/Xrandr.h>
 
 static evdi_handle g_handle = EVDI_INVALID_HANDLE;
 static int g_device_index = -1;
@@ -94,10 +96,57 @@ static volatile int g_buffers_ready = 0;
    still cutting idle work by an order of magnitude.
    The real fix is requesting an IDR on demand, which needs the in-process
    encoder rather than a pipe into the ffmpeg CLI. */
-#define IDLE_KEEPALIVE_MS 200
+/* At 33ms (~30fps) the idle floor keeps the encoder and the client's read
+   timeout smoothly paced without freezing, while identical frames consume
+   negligible bitrate in hardware encoders via skip macroblocks.
+   In Max Performance Mode, this is lowered to 16ms (approx 60 FPS). */
+#define DEFAULT_IDLE_KEEPALIVE_MS 33
+static int g_idle_keepalive_ms = DEFAULT_IDLE_KEEPALIVE_MS;
 static long long g_last_write_ms = 0;
 
 static long long now_us(void);
+/* Inter-process shared memory ring for microsecond stage timestamp tracking */
+#define TIMING_RING_SIZE 1024
+#define TIMING_MAGIC 0x55534352 /* 'USCR' */
+#define TIMING_VERSION 1
+
+struct FrameTimingRecord {
+    uint32_t seq;
+    uint32_t is_fresh;
+    uint64_t t_request_us;      /* Mutter frame request */
+    uint64_t t_ready_us;        /* Stage a: EVDI receives UPDATE_READY */
+    uint64_t t_grab_done_us;    /* Stage b: evdi_grab_pixels completes */
+    uint64_t t_conv_done_us;    /* Stage b': NV12 conversion complete */
+    uint64_t t_fifo_write_us;   /* Stage c: FIFO write completes (FFmpeg receives frame) */
+};
+
+struct SharedTimingRing {
+    uint32_t magic;
+    uint32_t version;
+    struct FrameTimingRecord records[TIMING_RING_SIZE];
+};
+
+static const char *g_timing_shm_path = NULL;
+static struct SharedTimingRing *g_timing_shm = NULL;
+static int g_timing_shm_fd = -1;
+static uint32_t g_fifo_seq = 0;
+
+static long long g_ready_us = 0;
+static long long g_conv_us = 0;
+
+static long long g_latest_req_us = 0;
+static long long g_latest_ready_us = 0;
+static long long g_latest_conv_us = 0;
+
+static long long g_write_req_us = 0;
+static long long g_write_ready_us = 0;
+static long long g_write_conv_us = 0;
+
+static long long g_conv_sum_us = 0;
+static int g_conv_n = 0;
+static long long g_write_sum_us = 0;
+static int g_write_n = 0;
+
 /* Capture-side latency: grab → NV12 → handed to the encoder's FIFO.
    Reported as percentiles so the cost of the pipe-to-ffmpeg design can be
    compared against the decode and wire costs measured on the other side. */
@@ -129,15 +178,154 @@ static long long g_grab_sum_us = 0;     /* evdi_grab_pixels duration */
 static int g_grab_n = 0;
 static int g_immediate_n = 0;           /* requests the kernel answered at once */
 static int g_empty_n = 0;               /* grabs that returned no damaged rects */
-/* Request the next frame as soon as the previous one has been grabbed
-   instead of waiting for the next period tick. USCREEN_NO_PIPELINE=1 restores
-   the strictly paced cycle for comparison. */
-static int g_pipeline = 1;
-static volatile long long g_last_request_ms = 0;
-
 static void handle_signal(int sig) {
     (void)sig;
     g_running = 0;
+}
+
+/* --- Dynamic Boundary Synchronization (Zero Ghost Cursor & Zero Boundary Lag) --- */
+static pthread_t g_boundary_thread = 0;
+static volatile int g_boundary_running = 0;
+static Display *g_x11_dpy = NULL;
+static Window g_nudge_win = 0;
+static int g_tablet_x = 1920;
+static int g_tablet_y = 165;
+static int g_tablet_w = 1464;
+static int g_tablet_h = 915;
+static volatile int g_pointer_in_tablet = 0;
+static volatile long long g_last_exit_time_us = 0;
+
+static inline void timespec_add_ns(struct timespec *ts, long long ns) {
+    ts->tv_nsec += ns;
+    while (ts->tv_nsec >= 1000000000L) {
+        ts->tv_nsec -= 1000000000L;
+        ts->tv_sec += 1;
+    }
+}
+
+static inline long long timespec_diff_ns(const struct timespec *a, const struct timespec *b) {
+    return (long long)(a->tv_sec - b->tv_sec) * 1000000000LL + (a->tv_nsec - b->tv_nsec);
+}
+
+static void *boundary_sync_thread(void *arg) {
+    (void)arg;
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 16000000L }; /* 16ms (~60Hz polling matching frame budget) */
+    int toggle = 1;
+    long long last_prewarm = 0;
+
+    while (g_running && g_boundary_running) {
+        nanosleep(&ts, NULL);
+        if (!g_x11_dpy || !g_nudge_win) continue;
+
+        Window root_ret, child_ret;
+        int rx = 0, ry = 0, wx = 0, wy = 0;
+        unsigned int mask = 0;
+        if (!XQueryPointer(g_x11_dpy, DefaultRootWindow(g_x11_dpy),
+                           &root_ret, &child_ret, &rx, &ry, &wx, &wy, &mask)) {
+            continue;
+        }
+
+        int in_tablet = (rx >= g_tablet_x && rx < (g_tablet_x + g_tablet_w) &&
+                         ry >= g_tablet_y && ry < (g_tablet_y + g_tablet_h));
+
+        if (g_pointer_in_tablet && !in_tablet) {
+            /* Mouse exited tablet -> laptop screen: force Mutter to schedule immediate clear frame */
+            g_pointer_in_tablet = 0;
+            g_last_exit_time_us = now_us();
+            toggle = (toggle == 1) ? 2 : 1;
+            XResizeWindow(g_x11_dpy, g_nudge_win, toggle, 1);
+            XFlush(g_x11_dpy);
+        } else if (!g_pointer_in_tablet && in_tablet) {
+            /* Mouse entered laptop -> tablet screen: wake frame clock */
+            g_pointer_in_tablet = 1;
+            toggle = (toggle == 1) ? 2 : 1;
+            XResizeWindow(g_x11_dpy, g_nudge_win, toggle, 1);
+            XFlush(g_x11_dpy);
+        } else if (!g_pointer_in_tablet &&
+                   rx >= (g_tablet_x - 40) && rx < g_tablet_x &&
+                   ry >= g_tablet_y && ry < (g_tablet_y + g_tablet_h)) {
+            /* Mouse approaching tablet boundary (within 40px): pre-warm frame clock */
+            long long now = now_us();
+            if (now - last_prewarm > 40000) { /* 25Hz max during approach */
+                last_prewarm = now;
+                toggle = (toggle == 1) ? 2 : 1;
+                XResizeWindow(g_x11_dpy, g_nudge_win, toggle, 1);
+                XFlush(g_x11_dpy);
+            }
+        }
+    }
+    return NULL;
+}
+
+static void init_boundary_sync(void) {
+    const char *disp_env = getenv("DISPLAY");
+    if (!disp_env) {
+        disp_env = ":0";
+    }
+    g_x11_dpy = XOpenDisplay(disp_env);
+    if (!g_x11_dpy) {
+        fprintf(stderr, "[evdi-helper] Boundary sync: could not open X11 display %s\n", disp_env);
+        return;
+    }
+
+    Window root = DefaultRootWindow(g_x11_dpy);
+    XRRScreenResources *res = XRRGetScreenResourcesCurrent(g_x11_dpy, root);
+    if (res) {
+        for (int i = 0; i < res->noutput; i++) {
+            XRROutputInfo *info = XRRGetOutputInfo(g_x11_dpy, res, res->outputs[i]);
+            if (info && info->connection == RR_Connected && info->crtc) {
+                if (strstr(info->name, "DVI-") || strstr(info->name, "UScreen") || strstr(info->name, "evdi")) {
+                    XRRCrtcInfo *crtc = XRRGetCrtcInfo(g_x11_dpy, res, info->crtc);
+                    if (crtc) {
+                        g_tablet_x = crtc->x;
+                        g_tablet_y = crtc->y;
+                        g_tablet_w = crtc->width;
+                        g_tablet_h = crtc->height;
+                        XRRFreeCrtcInfo(crtc);
+                    }
+                }
+            }
+            if (info) XRRFreeOutputInfo(info);
+        }
+        XRRFreeScreenResources(res);
+    }
+
+    fprintf(stderr, "[evdi-helper] Boundary sync initialized: tablet output at (%d,%d) %dx%d\n",
+            g_tablet_x, g_tablet_y, g_tablet_w, g_tablet_h);
+
+    XSetWindowAttributes attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.override_redirect = True;
+    attr.background_pixel = 0;
+    g_nudge_win = XCreateWindow(g_x11_dpy, root,
+                                g_tablet_x + 1, g_tablet_y + 1, 1, 1, 0,
+                                CopyFromParent, InputOutput, CopyFromParent,
+                                CWOverrideRedirect | CWBackPixel, &attr);
+    XSelectInput(g_x11_dpy, g_nudge_win, ExposureMask);
+    XMapWindow(g_x11_dpy, g_nudge_win);
+    XFlush(g_x11_dpy);
+
+    g_boundary_running = 1;
+    if (pthread_create(&g_boundary_thread, NULL, boundary_sync_thread, NULL) != 0) {
+        fprintf(stderr, "[evdi-helper] Failed to start boundary sync thread\n");
+        g_boundary_running = 0;
+    }
+}
+
+static void cleanup_boundary_sync(void) {
+    if (g_boundary_running) {
+        g_boundary_running = 0;
+        if (g_boundary_thread) pthread_join(g_boundary_thread, NULL);
+        g_boundary_thread = 0;
+    }
+    if (g_x11_dpy) {
+        if (g_nudge_win) {
+            XDestroyWindow(g_x11_dpy, g_nudge_win);
+            g_nudge_win = 0;
+        }
+        XCloseDisplay(g_x11_dpy);
+        g_x11_dpy = NULL;
+    }
 }
 
 static long long now_ms(void) {
@@ -150,6 +338,43 @@ static long long now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static void init_timing_shm(const char *path) {
+    if (!path) return;
+    g_timing_shm_fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (g_timing_shm_fd < 0) {
+        fprintf(stderr, "[evdi-helper] Could not open timing shm %s: %s\n", path, strerror(errno));
+        return;
+    }
+    if (ftruncate(g_timing_shm_fd, sizeof(struct SharedTimingRing)) != 0) {
+        fprintf(stderr, "[evdi-helper] ftruncate failed on %s: %s\n", path, strerror(errno));
+        close(g_timing_shm_fd);
+        g_timing_shm_fd = -1;
+        return;
+    }
+    void *ptr = mmap(NULL, sizeof(struct SharedTimingRing), PROT_READ | PROT_WRITE, MAP_SHARED, g_timing_shm_fd, 0);
+    if (ptr == MAP_FAILED) {
+        fprintf(stderr, "[evdi-helper] mmap failed on %s: %s\n", path, strerror(errno));
+        close(g_timing_shm_fd);
+        g_timing_shm_fd = -1;
+        return;
+    }
+    g_timing_shm = (struct SharedTimingRing *)ptr;
+    g_timing_shm->magic = TIMING_MAGIC;
+    g_timing_shm->version = TIMING_VERSION;
+    fprintf(stderr, "[evdi-helper] High-resolution timing SHM initialized at %s\n", path);
+}
+
+static void cleanup_timing_shm(void) {
+    if (g_timing_shm && g_timing_shm != MAP_FAILED) {
+        munmap(g_timing_shm, sizeof(struct SharedTimingRing));
+        g_timing_shm = NULL;
+    }
+    if (g_timing_shm_fd >= 0) {
+        close(g_timing_shm_fd);
+        g_timing_shm_fd = -1;
+    }
 }
 
 static void on_dpms(int dpms_mode, void *user_data) {
@@ -398,6 +623,8 @@ static int g_pool_active = 0;    /* worker jobs still running this gen */
 static int g_pool_shutdown = 0;
 
 static void *conv_worker(void *arg) {
+    int _ign = nice(2); /* Background priority to prevent starving GNOME Shell / Mutter compositor */
+    (void)_ign;
     int id = (int)(intptr_t)arg;
     int last_gen = 0;
     for (;;) {
@@ -421,13 +648,13 @@ static void *conv_worker(void *arg) {
 
 static void conv_pool_init(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
-    g_nthreads = (int)(n - 2);              /* leave cores for ffmpeg/KWin */
+    g_nthreads = (int)(n / 4);
     if (g_nthreads < 1) g_nthreads = 1;
-    if (g_nthreads > MAX_CONV_THREADS) g_nthreads = MAX_CONV_THREADS;
+    if (g_nthreads > 4) g_nthreads = 4;
     /* Worker threads handle jobs 1..n-1; the caller runs job 0 itself. */
     for (int i = 1; i < g_nthreads; i++)
         pthread_create(&g_pool[i], NULL, conv_worker, (void *)(intptr_t)i);
-    fprintf(stderr, "[evdi-helper] NV12 conversion using %d thread(s)\n", g_nthreads);
+    fprintf(stderr, "[evdi-helper] NV12 conversion using %d thread(s) (nice +2)\n", g_nthreads);
 }
 
 static void bgra_to_nv12(const unsigned char *src, unsigned char *dst,
@@ -493,9 +720,13 @@ static void publish_frame(void) {
     if (!g_buffers_ready || !g_framebuffer)
         return;
 
+    long long t_c0 = now_us();
     /* Only the rows this particular buffer is missing. */
     bgra_to_nv12(g_framebuffer, g_fill, g_dirty_fill);
     memset(g_dirty_fill, 0, (size_t)g_dirty_bytes);
+    g_conv_us = now_us();
+    g_conv_sum_us += g_conv_us - t_c0;
+    g_conv_n++;
 
     pthread_mutex_lock(&g_swap_mutex);
     unsigned char *tmp = g_latest;
@@ -506,7 +737,10 @@ static void publish_frame(void) {
     g_dirty_latest = g_dirty_fill;
     g_dirty_fill = dtmp;
     g_latest_valid = 1;
+    g_latest_req_us = g_req_us;
+    g_latest_ready_us = g_ready_us;
     g_latest_grab_us = g_grab_us;
+    g_latest_conv_us = g_conv_us;
     pthread_cond_signal(&g_frame_ready);
     pthread_mutex_unlock(&g_swap_mutex);
 }
@@ -666,6 +900,7 @@ static void grab_now(void) {
     if (num_rects > 0) {
         g_grab_count++;
         g_grab_us = now_us();
+        g_last_exit_time_us = 0;
         /* Under the swap lock: the writer thread reassigns the mask pointers
            when it takes a frame, so touching them unlocked would race.
            If the driver returned more rectangles than we gave it room for,
@@ -683,26 +918,15 @@ static void grab_now(void) {
 static void on_update_ready(int buffer_to_be_updated, void *user_data) {
     (void)user_data;
     (void)buffer_to_be_updated;
+    g_ready_us = now_us();
+    long long wait_us = 0;
     if (g_update_pending) {
-        g_wait_sum_us += now_us() - g_req_us;
+        wait_us = g_ready_us - g_req_us;
+        g_wait_sum_us += wait_us;
         g_wait_n++;
     }
     g_update_pending = 0;
     grab_now();
-    /* Ask for the next frame straight away rather than at the next tick of
-       the target period. The cycle is serial by the driver's design — the
-       compositor's flip only completes once we have copied the frame out,
-       and it renders the next one after that — so at 2960x1848 the two
-       halves (about 9 ms in KWin, 6 ms in the grab) already take a frame
-       period or more. Gating the request on the period as well pushed the
-       next request past the compositor's vblank slot, so a 30 fps target
-       delivered 24 and a 90 fps target 50-ish. The mode's refresh rate is
-       what paces the compositor; nothing here needs to hold it back. Asking
-       first from inside this handler, before the grab, was tried and is
-       worse (16 fps): the driver answers at once with the not-yet-grabbed
-       damage and the cycle falls apart. */
-    if (g_pipeline)
-        g_last_request_ms = 0;
 }
 
 static void on_crtc_state(int state, void *user_data) {
@@ -712,12 +936,13 @@ static void on_crtc_state(int state, void *user_data) {
 
 static void on_cursor_set(struct evdi_cursor_set cursor_set, void *user_data) {
     (void)user_data;
-    (void)cursor_set;
+    fprintf(stderr, "[evdi-helper] ON_CURSOR_SET enabled=%d hot=(%d,%d) size=(%ux%u)\n",
+            cursor_set.enabled, cursor_set.hot_x, cursor_set.hot_y, cursor_set.width, cursor_set.height);
 }
 
 static void on_cursor_move(struct evdi_cursor_move cursor_move, void *user_data) {
     (void)user_data;
-    (void)cursor_move;
+    fprintf(stderr, "[evdi-helper] ON_CURSOR_MOVE pos=(%d,%d)\n", cursor_move.x, cursor_move.y);
 }
 
 /* (Re)open the capture FIFO without blocking forever: O_NONBLOCK open fails
@@ -738,23 +963,14 @@ static int try_open_fifo(void) {
     return fd;
 }
 
-/* Writer thread: sends the most recent frame, woken by the grabber rather than
-   by a timer, and rate-limited so it never exceeds the target fps.
-
-   The previous version free-ran on clock_nanosleep, entirely independent of
-   when a frame was actually grabbed. A frame published just after a tick had to
-   wait a whole period before being sent — half a frame of pure added latency on
-   average, for nothing. Waiting on the condition variable removes that: the
-   frame goes out as soon as it exists, and the minimum-interval check below
-   still caps the rate.
-
-   Blocking writes here never stall capture, and the FIFO is reopened
-   automatically when the encoder restarts. */
+/* Writer thread: paces frames strictly at 1/fps intervals using high-resolution
+   timers (clock_nanosleep with CLOCK_MONOTONIC and TIMER_ABSTIME).
+   Zero timer drift, zero frame bursts, and anti-burst drift correction. */
 static void *writer_thread(void *arg) {
     (void)arg;
-    const long period_ns = 1000000000L / (g_fps > 0 ? g_fps : 60);
-    struct timespec next_allowed;
-    clock_gettime(CLOCK_MONOTONIC, &next_allowed);
+    const long long period_ns = 1000000000LL / (g_fps > 0 ? g_fps : 60);
+    struct timespec next_frame_time;
+    clock_gettime(CLOCK_MONOTONIC, &next_frame_time);
     int have_frame = 0;
     int frame_generation = -1;
 
@@ -765,30 +981,29 @@ static void *writer_thread(void *arg) {
                 /* No reader yet — poll slowly instead of spinning. */
                 struct timespec idle = { .tv_sec = 0, .tv_nsec = 50000000L };
                 nanosleep(&idle, NULL);
+                clock_gettime(CLOCK_MONOTONIC, &next_frame_time);
                 continue;
             }
+            clock_gettime(CLOCK_MONOTONIC, &next_frame_time);
         }
 
-        int size;
-        pthread_mutex_lock(&g_swap_mutex);
-        /* Wait for a frame, but no longer than one period so shutdown and
-           mode changes are still noticed promptly. */
-        while (g_running && (!g_buffers_ready || !g_latest_valid)) {
-            struct timespec wait_until;
-            clock_gettime(CLOCK_MONOTONIC, &wait_until);
-            wait_until.tv_nsec += period_ns;
-            while (wait_until.tv_nsec >= 1000000000L) {
-                wait_until.tv_nsec -= 1000000000L;
-                wait_until.tv_sec += 1;
-            }
-            if (pthread_cond_timedwait(&g_frame_ready, &g_swap_mutex,
-                                       &wait_until) == ETIMEDOUT)
-                break;
-        }
-        if (!g_running) {
-            pthread_mutex_unlock(&g_swap_mutex);
+        /* 1. Precision sleep until the scheduled frame release time using TIMER_ABSTIME */
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_frame_time, NULL);
+        if (!g_running)
             break;
+
+        /* 2. Advance schedule for next frame and apply anti-burst drift correction */
+        struct timespec now_ts;
+        clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        timespec_add_ns(&next_frame_time, period_ns);
+        /* If write took too long or thread was delayed, resync next_frame_time to prevent bursts */
+        if (timespec_diff_ns(&next_frame_time, &now_ts) <= 0) {
+            next_frame_time = now_ts;
+            timespec_add_ns(&next_frame_time, period_ns);
         }
+
+        /* 3. Extract the latest frame under lock */
+        pthread_mutex_lock(&g_swap_mutex);
         if (!g_buffers_ready) {
             pthread_mutex_unlock(&g_swap_mutex);
             continue;
@@ -807,54 +1022,44 @@ static void *writer_thread(void *arg) {
             g_dirty_write = g_dirty_latest;
             g_dirty_latest = dtmp;
             g_latest_valid = 0;
+            g_write_req_us = g_latest_req_us;
+            g_write_ready_us = g_latest_ready_us;
             g_write_grab_us = g_latest_grab_us;
+            g_write_conv_us = g_latest_conv_us;
             have_frame = 1;
             fresh = 1;
         }
-        size = g_packed_size;
+        int size = g_packed_size;
         g_writer_busy = have_frame;
         pthread_mutex_unlock(&g_swap_mutex);
 
         if (!have_frame)
             continue;  /* nothing grabbed yet for this mode */
 
-        /* Nothing changed on screen: don't re-send the identical frame.
-           A motionless desktop was still pushing 60 full NV12 frames a second
-           through the FIFO — 8.2MB each, roughly half a gigabyte per second of
-           pure memory traffic, plus an encode for every one of them, all to
-           transmit no new information. The occasional keepalive keeps the
-           encoder and the client's read timeout alive. */
+        /* In Max Performance Mode (g_idle_keepalive_ms <= 16), every frame tick is sent,
+           providing a locked 60 FPS stream to the tablet with zero drops.
+           In standard mode, motionless screens are kept alive every g_idle_keepalive_ms (33ms). */
         long long now_ms_write = now_ms();
-        if (!fresh && (now_ms_write - g_last_write_ms) < IDLE_KEEPALIVE_MS)
+        if (!fresh && (now_ms_write - g_last_write_ms) < g_idle_keepalive_ms) {
+            g_writer_busy = 0;
             continue;
+        }
+
+        /* Suppress re-sending stale frames containing a departed cursor during
+           the boundary transition (< 100ms after exit), until the compositor's
+           clean frame arrives. */
+        if (!fresh && g_last_exit_time_us > 0) {
+            long long since_exit_ms = (now_us() - g_last_exit_time_us) / 1000;
+            if (since_exit_ms < 100) {
+                g_writer_busy = 0;
+                continue;
+            }
+        }
         g_last_write_ms = now_ms_write;
 
-        /* Rate limit against an absolute schedule, never against "now".
-           Rebasing on now would add the wait and write time to every period,
-           so the stream drifts slower than the target — measured as 58fps
-           against a 60fps target, with ffmpeg reporting speed=0.97x. */
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        long long ahead_ns = (long long)(next_allowed.tv_sec - now.tv_sec) * 1000000000LL
-                           + (next_allowed.tv_nsec - now.tv_nsec);
-        if (ahead_ns > 0) {
-            struct timespec gap = { .tv_sec = ahead_ns / 1000000000LL,
-                                    .tv_nsec = ahead_ns % 1000000000LL };
-            nanosleep(&gap, NULL);
-        } else if (-ahead_ns > 4 * (long long)period_ns) {
-            /* Fallen far behind (a stalled encoder, a mode change): resync
-               instead of trying to catch up on a burst of stale frames. */
-            next_allowed = now;
-        }
-        next_allowed.tv_nsec += period_ns;
-        while (next_allowed.tv_nsec >= 1000000000L) {
-            next_allowed.tv_nsec -= 1000000000L;
-            next_allowed.tv_sec += 1;
-        }
-
         /* Bounded write: if the encoder stops reading for >250ms per chunk
-           it is stalled or dead — close the FIFO and resync on reopen.
-           An unbounded write() here would wedge the whole helper. */
+           it is stalled or dead — close the FIFO and resync on reopen. */
+        long long t_write_start = now_us();
         const unsigned char *ptr = g_write;
         size_t remaining = (size_t)size;
         while (remaining > 0 && g_running) {
@@ -878,9 +1083,26 @@ static void *writer_thread(void *arg) {
             remaining -= (size_t)written;
         }
         g_writer_busy = 0;
+        long long t_fifo_done = now_us();
+        if (remaining == 0) {
+            g_write_sum_us += t_fifo_done - t_write_start;
+            g_write_n++;
+        }
 
-        /* Only freshly grabbed frames say anything about capture latency;
-           keepalive repeats would report the age of stale content. */
+        uint32_t seq = g_fifo_seq++;
+        if (g_timing_shm && remaining == 0) {
+            uint32_t idx = seq % TIMING_RING_SIZE;
+            g_timing_shm->records[idx].seq = seq;
+            g_timing_shm->records[idx].is_fresh = fresh ? 1 : 0;
+            g_timing_shm->records[idx].t_request_us = (uint64_t)g_write_req_us;
+            g_timing_shm->records[idx].t_ready_us = (uint64_t)g_write_ready_us;
+            g_timing_shm->records[idx].t_grab_done_us = (uint64_t)g_write_grab_us;
+            g_timing_shm->records[idx].t_conv_done_us = (uint64_t)g_write_conv_us;
+            g_timing_shm->records[idx].t_fifo_write_us = (uint64_t)t_fifo_done;
+            __sync_synchronize();
+        }
+
+        /* Only freshly grabbed frames say anything about capture latency */
         if (fresh && remaining == 0 && g_write_grab_us > 0
                 && g_lat_count < LAT_SAMPLES) {
             long long d = now_us() - g_write_grab_us;
@@ -907,39 +1129,23 @@ static void run_event_loop(evdi_handle handle) {
     fds[0].events = POLLIN;
 
     long long last_stats_ms = now_ms();
-    long long last_fallback_grab_ms = 0;
-    if (getenv("USCREEN_NO_PIPELINE")) g_pipeline = 0;
     long long stats_grab_base = 0;
-    long request_period_ms = 1000 / (g_fps > 0 ? g_fps : 60);
-    if (request_period_ms < 1) request_period_ms = 1;
+    long long request_period_ns = 1000000000LL / (g_fps > 0 ? g_fps : 60);
+    struct timespec next_request_time;
+    clock_gettime(CLOCK_MONOTONIC, &next_request_time);
 
     while (g_running) {
-        /* Sleep exactly until the next capture request is due instead of a
-           fixed 4ms tick. The fixed tick quantised every request to a 4ms grid,
-           adding up to 4ms of jitter per frame — a quarter of the entire budget
-           at 60fps, and half of it at 120.
-           With no mode there is nothing to request, and the deadline below
-           would sit permanently in the past — poll would return instantly and
-           the loop would spin at 100% of a core. Wait on events only. */
-        int timeout_ms;
+        struct timespec now_ts;
+        clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        long long due_diff_ns = timespec_diff_ns(&next_request_time, &now_ts);
+        int timeout_ms = 4;
         if (!g_have_mode) {
             timeout_ms = 100;
         } else if (g_update_pending) {
-            /* Waiting for update_ready. The capture deadline below has already
-               passed and cannot advance until the request completes, so
-               deriving a timeout from it yields 0 forever and poll returns
-               instantly — the loop then burns a whole core. This is not a
-               rare state: disabling the virtual output leaves a mode set with
-               nothing rendering to it, which is exactly what happens when the
-               tablet is unplugged or switched to pen-only.
-               Sleep until the watchdog is due instead. update_ready wakes poll
-               the moment it arrives, so nothing is delayed when the
-               compositor is actually running. */
-            long long left = g_last_request_ms + 250 - now_ms();
-            timeout_ms = left < 0 ? 0 : (left > 250 ? 250 : (int)left);
+            /* Waiting for update_ready from compositor. */
+            timeout_ms = 16;
         } else {
-            long long due = g_last_request_ms + request_period_ms;
-            timeout_ms = (int)(due - now_ms());
+            timeout_ms = (int)(due_diff_ns / 1000000LL);
             if (timeout_ms < 0) timeout_ms = 0;
             if (timeout_ms > 4) timeout_ms = 4;   /* stay responsive to events */
         }
@@ -959,47 +1165,49 @@ static void run_event_loop(evdi_handle handle) {
         if (!g_have_mode)
             continue;
 
-        long long now = now_ms();
+        clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        due_diff_ns = timespec_diff_ns(&next_request_time, &now_ts);
 
         /* Core capture cycle: request a fresh frame from the compositor at
-           the target fps. If the kernel says pixels are ready right away,
-           grab immediately; otherwise update_ready will fire and grab. */
-        if (!g_update_pending && (now - g_last_request_ms) >= request_period_ms) {
-            g_last_request_ms = now;
+           the target fps strictly paced to avoid flooding Mutter or EVDI. */
+        if (!g_update_pending && due_diff_ns <= 0) {
+            timespec_add_ns(&next_request_time, request_period_ns);
+            clock_gettime(CLOCK_MONOTONIC, &now_ts);
+            if (timespec_diff_ns(&next_request_time, &now_ts) <= 0) {
+                next_request_time = now_ts;
+                timespec_add_ns(&next_request_time, request_period_ns);
+            }
             g_req_us = now_us();
             if (evdi_request_update(handle, 0)) {
                 g_immediate_n++;
+                g_ready_us = g_req_us;
                 grab_now();
             } else {
                 g_update_pending = 1;
             }
         }
 
-        /* Watchdog: if a request got lost (compositor hiccup), don't stay
-           stuck waiting for update_ready forever. */
-        if (g_update_pending && (now - g_last_request_ms) > 250) {
-            g_update_pending = 0;
-            grab_now();
-        }
+        /* Note: When g_update_pending is true, do NOT call grab_now() or
+           evdi_request_update(). Calling evdi_grab_pixels without update_ready
+           or requesting while already requested corrupts the EVDI driver state,
+           flooding the kernel log and causing Mutter compositor mutex stalls.
+           The kernel driver will fire update_ready as soon as the compositor commits. */
 
-        /* Fallback grab once a second in case no events flow at all */
-        if ((now - last_fallback_grab_ms) >= 1000) {
-            last_fallback_grab_ms = now;
-            if (!g_update_pending)
-                grab_now();
-        }
-
+        long long now = now_ms();
         if (now - last_stats_ms >= 5000) {
             double elapsed = (now - last_stats_ms) / 1000.0;
             long long grabs = g_grab_count - stats_grab_base;
             fprintf(stderr, "[evdi-helper] %.1f grabs/s (total %lld), mode:%d dpms:%d pending:%d\n",
                     elapsed > 0 ? grabs / elapsed : 0,
                     g_grab_count, g_have_mode, g_dpms_on, g_update_pending);
-            fprintf(stderr, "[evdi-helper] cycle: request→ready avg %.1fms (%d waited, %d immediate), grab avg %.1fms (%d, %d empty)\n",
+            fprintf(stderr, "[evdi-helper] stages: req→ready avg %.1fms (%d waited, %d imm), grab avg %.1fms, conv avg %.1fms, write avg %.1fms\n",
                     g_wait_n ? g_wait_sum_us / 1000.0 / g_wait_n : 0.0, g_wait_n, g_immediate_n,
-                    g_grab_n ? g_grab_sum_us / 1000.0 / g_grab_n : 0.0, g_grab_n, g_empty_n);
+                    g_grab_n ? g_grab_sum_us / 1000.0 / g_grab_n : 0.0,
+                    g_conv_n ? g_conv_sum_us / 1000.0 / g_conv_n : 0.0,
+                    g_write_n ? g_write_sum_us / 1000.0 / g_write_n : 0.0);
             g_wait_sum_us = 0; g_wait_n = 0; g_grab_sum_us = 0; g_grab_n = 0;
             g_immediate_n = 0; g_empty_n = 0;
+            g_conv_sum_us = 0; g_conv_n = 0; g_write_sum_us = 0; g_write_n = 0;
 
             /* Capture-side latency: grab → convert → into the encoder's FIFO. */
             pthread_mutex_lock(&g_swap_mutex);
@@ -1087,6 +1295,11 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
             g_fps = atoi(argv[++i]);
             if (g_fps < 1 || g_fps > 240) g_fps = 60;
+        } else if (strcmp(argv[i], "--max-performance") == 0) {
+            g_idle_keepalive_ms = 16;
+            fprintf(stderr, "[evdi-helper] Max Performance Mode enabled: idle keepalive set to 16ms (~60 FPS)\n");
+        } else if (strcmp(argv[i], "--timing-shm") == 0 && i + 1 < argc) {
+            g_timing_shm_path = argv[++i];
         }
     }
 
@@ -1151,6 +1364,7 @@ int main(int argc, char *argv[]) {
     }
     g_device_index = dev_idx;
     g_handle = handle;
+    evdi_enable_cursor_events(handle, true);
 
     FILE *f = fopen(edid_path, "rb");
     if (!f) {
@@ -1193,6 +1407,9 @@ int main(int argc, char *argv[]) {
     pthread_t writer = 0;
     if (fifo_path) {
         g_fifo_path = fifo_path;
+        if (g_timing_shm_path) {
+            init_timing_shm(g_timing_shm_path);
+        }
         conv_pool_init();   /* spawn NV12 conversion workers before first grab */
         fprintf(stderr, "[evdi-helper] Capture FIFO: %s (opened on demand)\n", fifo_path);
         if (pthread_create(&writer, NULL, writer_thread, NULL) != 0) {
@@ -1202,7 +1419,9 @@ int main(int argc, char *argv[]) {
     }
 
     fprintf(stderr, "[evdi-helper] Connected. Capture at %d fps. Entering event loop.\n", g_fps);
+    init_boundary_sync();
     run_event_loop(handle);
+    cleanup_boundary_sync();
 
     g_running = 0;
     /* Wake the writer out of its condition wait so shutdown is immediate
@@ -1224,6 +1443,7 @@ int main(int argc, char *argv[]) {
     evdi_disconnect(handle);
     evdi_close(handle);
     g_handle = EVDI_INVALID_HANDLE;
+    cleanup_timing_shm();
 
     fprintf(stderr, "[evdi-helper] Done.\n");
     return 0;

@@ -12,7 +12,11 @@ all: build
 
 # Generic -O3 (no -march=native): release binaries must run on any x86-64 CPU
 build-helper:
-	$(CC) -O3 -o host/evdi/evdi_helper host/evdi/evdi_helper.c -levdi -lpthread -Ihost/evdi
+	$(CC) -O3 -o host/evdi/evdi_helper host/evdi/evdi_helper.c /lib/libevdi.so.1 -lpthread -lX11 -lXrandr -Ihost/evdi
+	mkdir -p target/release target/debug $(BIN_DIR)
+	rm -f target/release/evdi_helper $(BIN_DIR)/evdi_helper
+	cp host/evdi/evdi_helper target/release/evdi_helper
+	cp host/evdi/evdi_helper $(BIN_DIR)/evdi_helper
 	@echo "✓ EVDI helper: host/evdi/evdi_helper"
 
 build: build-helper
@@ -41,7 +45,7 @@ install: build edid
 # One-time system setup (needs sudo): pre-create an EVDI device at boot so
 # the daemon never needs root, and load the required modules.
 setup-system:
-	echo "options evdi initial_device_count=1" | sudo tee /etc/modprobe.d/uscreen-evdi.conf
+	printf "options evdi initial_device_count=2\nsoftdep evdi pre: drm_kms_helper i915\n" | sudo tee /etc/modprobe.d/uscreen-evdi.conf
 	printf "evdi\nuinput\n" | sudo tee /etc/modules-load.d/uscreen.conf
 	sudo modprobe evdi || true
 	sudo modprobe uinput || true

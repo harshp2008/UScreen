@@ -62,6 +62,15 @@ class Prefs(context: Context) {
         set(v) = sp.edit().putBoolean("touch_enabled", v).apply()
 
     /**
+     * Opt-in immersive mode: hides the settings handle, expands into cutout,
+     * and maps the Android Back button to toggle the settings sheet.
+     * Default is false (OFF), matching original APK behavior.
+     */
+    var immersiveModeEnabled: Boolean
+        get() = sp.getBoolean("immersive_mode_enabled", false)
+        set(v) = sp.edit().putBoolean("immersive_mode_enabled", v).apply()
+
+    /**
      * Which way round the tablet is held: [ORIENTATION_AUTO] follows the
      * sensor between the two landscape directions, the other two pin it.
      * Pinning exists because the sensor path does not work everywhere — a

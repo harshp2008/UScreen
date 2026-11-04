@@ -196,6 +196,10 @@ pub struct CaptureConfig {
     /// EVDI card to pin the helper to. None lets the helper pick a free one,
     /// which is only safe with a single tablet.
     pub card: Option<u32>,
+    /// When true and power profile is "performance", forces 60 FPS keepalive stream.
+    pub max_performance_mode: bool,
+    /// When true, enables advanced low-latency parameters on HEVC VAAPI encoder.
+    pub hevc_low_latency_tuning: bool,
 }
 
 impl Default for CaptureConfig {
@@ -216,6 +220,8 @@ impl Default for CaptureConfig {
             ten_bit: false,
             instance: 0,
             card: None,
+            max_performance_mode: false,
+            hevc_low_latency_tuning: true,
         }
     }
 }
@@ -660,14 +666,48 @@ impl CaptureManager {
         }
 
         cmd.args(["--capture-fifo", &fifo]);
+        let timing_shm = crate::runtime::timing_path_for(self.config.instance);
+        cmd.args(["--timing-shm", &timing_shm.to_string_lossy()]);
         if let Some(card) = self.config.card {
             cmd.args(["--card", &card.to_string()]);
+        }
+
+        if self.config.max_performance_mode {
+            let profile = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                Command::new("powerprofilesctl").arg("get").output(),
+            )
+            .await;
+            match profile {
+                Ok(Ok(output)) if output.status.success() => {
+                    let current = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    info!("Checked power profile: '{}'", current);
+                    if current == "performance" {
+                        info!("Max Performance Mode active (performance profile detected): appending --max-performance to evdi_helper arguments");
+                        cmd.arg("--max-performance");
+                    } else {
+                        info!("Max Performance Mode configured, but power profile is '{}' (not 'performance') - running standard pacing", current);
+                    }
+                }
+                _ => {
+                    warn!("Failed or timed out querying powerprofilesctl");
+                }
+            }
         }
 
         cmd.stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .stdin(Stdio::null())
             .kill_on_drop(true);
+
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                // Set evdi_helper to nice +1 to prioritize GNOME Mutter compositor
+                libc::setpriority(libc::PRIO_PROCESS, 0, 1);
+                Ok(())
+            });
+        }
 
         let mut child = cmd.spawn().context("Failed to spawn evdi-helper")?;
 
@@ -765,34 +805,20 @@ impl CaptureManager {
     }
 
     #[cfg(not(feature = "inproc-encoder"))]
-    async fn start_encoder(&mut self) -> Result<()> {
-        // Accept the old gstreamer-style name as an alias
-        let encoder = if self.config.encoder == "vaapih264enc" {
-            "h264_vaapi".to_string()
-        } else {
-            self.config.encoder.clone()
+    fn spawn_encoder_child(&self, encoder: &str) -> Result<Child> {
+        let res: Result<()> = match encoder {
+            "h264_nvenc" | "hevc_nvenc" | "h264_vaapi" | "hevc_vaapi" | "libx264" => Ok(()),
+            _ => anyhow::bail!(
+                "Unknown encoder: {}. Use h264_nvenc, hevc_nvenc, h264_vaapi, hevc_vaapi, or libx264",
+                encoder
+            ),
         };
-        // Always the size the helper really emits, never the one we asked for:
-        // a mismatch here shows up as a permanently skewed picture.
+        res?;
+
         let (w, h) = self.active_mode();
-        let n = self.config.stream_scale.max(1);
-        let expected = (
-            ((self.config.width / n) & !1).max(2),
-            ((self.config.height / n) & !1).max(2),
-        );
-        if (w, h) != expected {
-            warn!(
-                "Encoding at {}x{}, expected {}x{} — the compositor did not honour \
-                 the requested mode",
-                w, h, expected.0, expected.1
-            );
-        } else if n > 1 {
-            info!("Encoding at {}x{} (desktop {}x{}, stream scale {})",
-                  w, h, self.config.width, self.config.height, n);
-        }
         let fps = self.config.fps;
         let bitrate = self.config.bitrate;
-        let codec = Codec::from_encoder(&encoder);
+        let codec = Codec::from_encoder(encoder);
         // 10-bit only makes sense on HEVC here: NVENC's H.264 encoder is
         // 8-bit, so asking for it there would silently do nothing.
         let ten_bit = self.config.ten_bit && codec == Codec::Hevc;
@@ -805,7 +831,7 @@ impl CaptureManager {
 
         let mut encoder_args: Vec<String> = vec!["-hide_banner".into()];
 
-        if encoder == "h264_vaapi" {
+        if encoder == "h264_vaapi" || encoder == "hevc_vaapi" {
             encoder_args.extend_from_slice(&[
                 "-vaapi_device".into(),
                 crate::encoders::vaapi_device(),
@@ -851,22 +877,19 @@ impl CaptureManager {
             fifo_path_for(self.config.instance),
         ]);
 
-        if encoder == "h264_vaapi" {
-            encoder_args.extend_from_slice(&[
-                "-vf".into(),
-                "format=nv12,hwupload".into(),
-            ]);
-        }
-
-        // The FIFO carries 8-bit NV12, so 10-bit encoding needs a conversion
-        // first. Done here rather than in the helper to keep the FIFO format
-        // single: the helper stays the one thing that never has to know which
-        // codec is in use.
-        if ten_bit {
+        if encoder == "h264_vaapi" || encoder == "hevc_vaapi" {
+            // For VAAPI hardware encode, directly upload the 8-bit NV12 frames from the capture FIFO.
+            // Avoid software CPU conversion to p010le which burns 240% CPU and starves the compositor.
+            encoder_args.extend_from_slice(&["-vf".into(), "format=nv12,hwupload".into()]);
+        } else if ten_bit {
+            // The FIFO carries 8-bit NV12, so 10-bit encoding needs a conversion
+            // first. Done here rather than in the helper to keep the FIFO format
+            // single: the helper stays the one thing that never has to know which
+            // codec is in use.
             encoder_args.extend_from_slice(&["-vf".into(), "format=p010le".into()]);
         }
 
-        encoder_args.extend_from_slice(&["-c:v".into(), encoder.clone()]);
+        encoder_args.extend_from_slice(&["-c:v".into(), encoder.to_string()]);
 
         if encoder.ends_with("_nvenc") {
             let bitrate_m = bitrate as f64 / 1000.0;
@@ -923,7 +946,7 @@ impl CaptureManager {
                     "main10".into(),
                 ]);
             }
-        } else if encoder == "h264_vaapi" {
+        } else if encoder == "h264_vaapi" || encoder == "hevc_vaapi" {
             // Constant quality, for the same reason as NVENC above: a static
             // desktop should cost nothing, and the bitrate is only a ceiling.
             encoder_args.extend_from_slice(&[
@@ -939,7 +962,26 @@ impl CaptureManager {
                 gop.to_string(),
                 "-idr_interval".into(),
                 "1".into(),
+                "-async_depth".into(),
+                "1".into(),
             ]);
+            if encoder == "hevc_vaapi" {
+                // Main profile uses direct 8-bit NV12 hardware encoding on Intel Arc
+                encoder_args.extend_from_slice(&[
+                    "-profile:v".into(),
+                    "main".into(),
+                ]);
+                if self.config.hevc_low_latency_tuning {
+                    encoder_args.extend_from_slice(&[
+                        "-b_depth".into(),
+                        "1".into(),
+                        "-sei".into(),
+                        "0".into(),
+                        "-aud".into(),
+                        "0".into(),
+                    ]);
+                }
+            }
         } else if encoder == "libx264" {
             let bufsize_k = (bitrate * 2 / fps.max(1)).max(200);
             encoder_args.extend_from_slice(&[
@@ -960,7 +1002,7 @@ impl CaptureManager {
             ]);
         } else {
             anyhow::bail!(
-                "Unknown encoder: {}. Use h264_nvenc, hevc_nvenc, h264_vaapi, or libx264",
+                "Unknown encoder: {}. Use h264_nvenc, hevc_nvenc, h264_vaapi, hevc_vaapi, or libx264",
                 encoder
             );
         }
@@ -978,7 +1020,62 @@ impl CaptureManager {
             .stdin(Stdio::null())
             .kill_on_drop(true);
 
-        let child = cmd.spawn().context("Failed to spawn ffmpeg encoder")?;
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                // Lower FFmpeg CPU priority (nice +5) so Mutter and desktop presentation are never starved
+                libc::setpriority(libc::PRIO_PROCESS, 0, 5);
+                Ok(())
+            });
+        }
+
+        cmd.spawn().context("Failed to spawn ffmpeg encoder")
+    }
+
+    #[cfg(not(feature = "inproc-encoder"))]
+    async fn start_encoder(&mut self) -> Result<()> {
+        // Accept the old gstreamer-style name as an alias
+        let encoder = if self.config.encoder == "vaapih264enc" {
+            "h264_vaapi".to_string()
+        } else {
+            self.config.encoder.clone()
+        };
+        // Always the size the helper really emits, never the one we asked for:
+        // a mismatch here shows up as a permanently skewed picture.
+        let (w, h) = self.active_mode();
+        let n = self.config.stream_scale.max(1);
+        let expected = (
+            ((self.config.width / n) & !1).max(2),
+            ((self.config.height / n) & !1).max(2),
+        );
+        if (w, h) != expected {
+            warn!(
+                "Encoding at {}x{}, expected {}x{} — the compositor did not honour \
+                 the requested mode",
+                w, h, expected.0, expected.1
+            );
+        } else if n > 1 {
+            info!("Encoding at {}x{} (desktop {}x{}, stream scale {})",
+                  w, h, self.config.width, self.config.height, n);
+        }
+
+        let child = match self.spawn_encoder_child(&encoder) {
+            Ok(child) => child,
+            Err(e) => {
+                if encoder == "hevc_vaapi" {
+                    warn!(
+                        "Encoder hevc_vaapi failed to initialize ({}). Attempting graceful fallback to h264_vaapi",
+                        e
+                    );
+                    self.config.encoder = "h264_vaapi".to_string();
+                    self.spawn_encoder_child("h264_vaapi")
+                        .context("Failed to spawn fallback h264_vaapi encoder")?
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+
         info!("Encoder started (PID: {})", child.id().unwrap_or(0));
         self.encoder_child = Some(child);
         Ok(())
@@ -1169,7 +1266,8 @@ impl CaptureManager {
                     let (tx2, cc, lat) =
                         (tx.clone(), self.codec_config.clone(), self.latency.clone());
                     let codec = Codec::from_encoder(&self.config.encoder);
-                    tokio::spawn(async move { Self::read_loop(stdout, tx2, cc, lat, codec).await })
+                    let timing_shm = crate::runtime::timing_path_for(self.config.instance);
+                    tokio::spawn(async move { Self::read_loop(stdout, tx2, cc, lat, codec, timing_shm).await })
                 }
                 #[cfg(feature = "inproc-encoder")]
                 {
@@ -1227,8 +1325,20 @@ impl CaptureManager {
                 joined = &mut encode_task => {
                     match joined {
                         Ok(Ok(_)) => info!("Encoder finished"),
-                        Ok(Err(e)) => warn!("Encoder error: {}. Restarting...", e),
-                        Err(e) => warn!("Encoder task failed: {}. Restarting...", e),
+                        Ok(Err(e)) => {
+                            warn!("Encoder error: {}. Restarting...", e);
+                            if self.config.encoder == "hevc_vaapi" {
+                                warn!("hevc_vaapi failed during streaming; falling back to h264_vaapi");
+                                self.config.encoder = "h264_vaapi".to_string();
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Encoder task failed: {}. Restarting...", e);
+                            if self.config.encoder == "hevc_vaapi" {
+                                warn!("hevc_vaapi failed during streaming; falling back to h264_vaapi");
+                                self.config.encoder = "h264_vaapi".to_string();
+                            }
+                        }
                     }
                 }
                 _ = settings_rx.changed() => {
@@ -1395,6 +1505,7 @@ impl CaptureManager {
         codec_config: Arc<Mutex<Option<Bytes>>>,
         latency: crate::latency::LatencyTracker,
         codec: Codec,
+        timing_shm: std::path::PathBuf,
     ) -> Result<()> {
         let mut buf = vec![0u8; 512 * 1024];
         let mut total: u64 = 0;
@@ -1402,6 +1513,7 @@ impl CaptureManager {
         let mut last_log = Instant::now();
         let mut packetizer = H264AnnexBPacketizer::new(codec);
         let mut config_extracted = codec_config.lock().ok().and_then(|g| g.clone()).is_some();
+        let timing_reader = crate::timing::TimingReader::open(&timing_shm);
 
         loop {
             let n = stdout
@@ -1436,10 +1548,28 @@ impl CaptureManager {
                 }
             }
 
+            let now_us = crate::timing::now_monotonic_us();
             for data in access_units {
                 frames += 1;
                 if tx.receiver_count() > 0 {
-                    latency.on_encoded(data.seq);
+                    let detailed = timing_reader.as_ref().and_then(|tr| tr.get_record(data.seq)).map(|rec| {
+                        let req_to_ready_us = rec.t_ready_us.saturating_sub(rec.t_request_us) as u32;
+                        let grab_us = rec.t_grab_done_us.saturating_sub(rec.t_ready_us) as u32;
+                        let conv_us = rec.t_conv_done_us.saturating_sub(rec.t_grab_done_us) as u32;
+                        let fifo_wait_write_us = rec.t_fifo_write_us.saturating_sub(rec.t_conv_done_us) as u32;
+                        let encode_us = now_us.saturating_sub(rec.t_fifo_write_us) as u32;
+                        let host_total_us = now_us.saturating_sub(rec.t_ready_us) as u32;
+                        crate::latency::DetailedTiming {
+                            is_fresh: rec.is_fresh != 0,
+                            req_to_ready_us,
+                            grab_us,
+                            conv_us,
+                            fifo_wait_write_us,
+                            encode_us,
+                            host_total_us,
+                        }
+                    });
+                    latency.on_encoded_with_timing(data.seq, detailed);
                     let _ = tx.send(data);
                 }
             }
@@ -1897,6 +2027,20 @@ mod tests {
         assert_eq!(Codec::from_encoder("libx264"), Codec::H264);
         assert_eq!(Codec::from_encoder("hevc_nvenc"), Codec::Hevc);
         assert_eq!(Codec::from_encoder("hevc_vaapi"), Codec::Hevc);
+    }
+
+    #[test]
+    fn allowed_encoders_include_hevc_vaapi() {
+        let check = |name: &str| -> Result<()> {
+            match name {
+                "h264_nvenc" | "hevc_nvenc" | "h264_vaapi" | "hevc_vaapi" | "libx264" => Ok(()),
+                _ => anyhow::bail!("Unknown encoder: {name}"),
+            }
+        };
+        for name in ["h264_nvenc", "hevc_nvenc", "h264_vaapi", "hevc_vaapi", "libx264"] {
+            assert!(check(name).is_ok());
+        }
+        assert!(check("invalid_enc").is_err());
     }
 
     #[test]

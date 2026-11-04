@@ -54,6 +54,8 @@ pub struct TabletProfile {
     pub quality: Option<u32>,
     pub stream_scale: Option<u32>,
     pub position: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoder: Option<String>,
 }
 
 impl TabletProfile {
@@ -145,6 +147,11 @@ pub struct FileConfig {
     pub input_port: u16,
     /// Launch the UScreen app on the tablet automatically when it's plugged in
     pub auto_launch_app: bool,
+    /// When enabled and system power profile is "performance", forces 60 FPS stream
+    /// even when cursor is on the primary display.
+    pub max_performance_mode: bool,
+    /// When enabled, applies aggressive low-latency tuning flags to HEVC VAAPI encoder.
+    pub hevc_low_latency_tuning: bool,
 }
 
 impl Default for FileConfig {
@@ -171,6 +178,8 @@ impl Default for FileConfig {
             video_port: 8890,
             input_port: 8891,
             auto_launch_app: true,
+            max_performance_mode: false,
+            hevc_low_latency_tuning: true,
         }
     }
 }
@@ -285,5 +294,46 @@ impl FileConfig {
         std::fs::write(&tmp, text).context("write config file")?;
         std::fs::rename(&tmp, &path).context("replace config file")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_device_encoder_deserialization_and_serialization() {
+        let toml_data = r#"
+encoder = "h264_vaapi"
+fps = 60
+
+[tablets.DEVICE_A]
+label = "Galaxy Tab S9 FE"
+width = 2560
+height = 1600
+encoder = "hevc_vaapi"
+
+[tablets.DEVICE_B]
+label = "Old Phone"
+width = 1920
+height = 1080
+"#;
+
+        let cfg: FileConfig = toml::from_str(toml_data).expect("parse config");
+        assert_eq!(cfg.encoder, "h264_vaapi");
+
+        let tablet_a = cfg.tablets.get("DEVICE_A").expect("DEVICE_A profile");
+        assert_eq!(tablet_a.encoder.as_deref(), Some("hevc_vaapi"));
+        assert_eq!(tablet_a.width, 2560);
+
+        let tablet_b = cfg.tablets.get("DEVICE_B").expect("DEVICE_B profile");
+        assert_eq!(tablet_b.encoder, None);
+        assert_eq!(tablet_b.width, 1920);
+
+        let serialized = toml::to_string_pretty(&cfg).expect("serialize config");
+        assert!(serialized.contains("encoder = \"hevc_vaapi\""));
+        let re_parsed: FileConfig = toml::from_str(&serialized).expect("re-parse");
+        assert_eq!(re_parsed.tablets.get("DEVICE_B").unwrap().encoder, None);
+        assert_eq!(re_parsed.tablets.get("DEVICE_A").unwrap().encoder.as_deref(), Some("hevc_vaapi"));
     }
 }

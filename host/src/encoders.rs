@@ -12,7 +12,7 @@ use tracing::{info, warn};
 /// In order of preference. NVENC and VAAPI are the two hardware paths this
 /// project tunes for; libx264 works everywhere and is what a laptop without
 /// either falls back to.
-pub const CANDIDATES: [&str; 3] = ["h264_nvenc", "h264_vaapi", "libx264"];
+pub const CANDIDATES: [&str; 4] = ["h264_nvenc", "h264_vaapi", "hevc_vaapi", "libx264"];
 
 const DEFAULT_VAAPI_DEVICE: &str = "/dev/dri/renderD128";
 static VAAPI_DEVICE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -176,10 +176,15 @@ pub async fn resolve(configured: &str) -> Option<String> {
         Err(e) => e,
     };
     let mut fallback = None;
-    for e in CANDIDATES.into_iter().filter(|e| *e != configured) {
-        if works(e).await {
-            fallback = Some(e);
-            break;
+    if configured == "hevc_vaapi" && works("h264_vaapi").await {
+        fallback = Some("h264_vaapi");
+    }
+    if fallback.is_none() {
+        for e in CANDIDATES.into_iter().filter(|e| *e != configured) {
+            if works(e).await {
+                fallback = Some(e);
+                break;
+            }
         }
     }
     match fallback {
@@ -192,7 +197,7 @@ pub async fn resolve(configured: &str) -> Option<String> {
             Some(e.to_string())
         }
         None => {
-            info!("No H.264 encoder works here: tried {}", CANDIDATES.join(", "));
+            info!("No video encoder works here: tried {}", CANDIDATES.join(", "));
             None
         }
     }
@@ -218,6 +223,9 @@ mod tests {
         let a = setup_args("h264_vaapi", "/dev/dri/renderD129");
         assert_eq!(a[0], "-vaapi_device");
         assert_eq!(a[1], "/dev/dri/renderD129");
+        let a2 = setup_args("hevc_vaapi", "/dev/dri/renderD129");
+        assert_eq!(a2[0], "-vaapi_device");
+        assert_eq!(a2[1], "/dev/dri/renderD129");
         assert!(setup_args("h264_nvenc", "/dev/dri/renderD129").is_empty());
     }
 }

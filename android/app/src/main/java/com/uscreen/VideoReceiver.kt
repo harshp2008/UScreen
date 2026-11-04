@@ -266,16 +266,48 @@ class VideoReceiver {
             // this decoder has already stalled on them, see lowLatencyHints.
             if (decoderTier == 0) {
                 if (android.os.Build.VERSION.SDK_INT >= 30) {
-                    format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                    try {
+                        format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                    } catch (_: Exception) {}
+                    try {
+                        // KEY_LATENCY: 0 requests immediate presentation with zero frame buffer delay
+                        format.setInteger(MediaFormat.KEY_LATENCY, 0)
+                    } catch (_: Exception) {}
                 }
                 try {
-                    // Ask the decoder to run flat out rather than pace to the
-                    // frame rate — headroom above the stream rate, so a late
-                    // frame is caught up on instead of waiting for the next slot.
-                    format.setInteger("operating-rate", streamFps * 2)
+                    format.setInteger("low-latency", 1)
                 } catch (_: Exception) {}
                 try {
+                    format.setInteger("latency", 0)
+                } catch (_: Exception) {}
+                try {
+                    // Instruct decoder to drop delayed/buffered B-frames immediately
+                    format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                } catch (_: Exception) {}
+                try {
+                    // Realtime priority: tells Android framework and Codec2 to prioritize
+                    // frame scheduling over power saving.
+                    format.setInteger(MediaFormat.KEY_PRIORITY, 0)
+                } catch (_: Exception) {}
+                try {
+                    // Operating rate: request the target stream rate without exceeding hardware
+                    // limits on high-resolution displays (e.g. 2560x1600 / 2880x1800).
+                    format.setInteger(MediaFormat.KEY_OPERATING_RATE, streamFps)
+                } catch (_: Exception) {}
+                try {
+                    // Samsung Exynos low-latency decoder mode
+                    format.setInteger("vendor.sec-ext-dec-low-latency.enable", 1)
+                } catch (_: Exception) {}
+                try {
+                    format.setInteger("vendor.sec-dec-low-latency.enable", 1)
+                } catch (_: Exception) {}
+                try {
+                    // Qualcomm Snapdragon low-latency decoder mode
                     format.setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
+                } catch (_: Exception) {}
+                try {
+                    // Realtek / MediaTek low-latency decoder mode
+                    format.setInteger("vendor.rtc-ext-dec-low-latency.enable", 1)
                 } catch (_: Exception) {}
             } else {
                 Log.w(TAG, "Configuring decoder without low-latency hints")
@@ -309,6 +341,17 @@ class VideoReceiver {
             }, Handler(cbThread.looper))
 
             codec.start()
+            if (decoderTier == 0 && android.os.Build.VERSION.SDK_INT >= 30) {
+                try {
+                    val bundle = android.os.Bundle().apply {
+                        putInt(MediaCodec.PARAMETER_KEY_LOW_LATENCY, 1)
+                    }
+                    codec.setParameters(bundle)
+                    Log.i(TAG, "Applied PARAMETER_KEY_LOW_LATENCY=1 to codec runtime parameters")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Could not set PARAMETER_KEY_LOW_LATENCY", e)
+                }
+            }
             mediaCodec = codec
             codecAlive = true
             startOutputThread(codec)

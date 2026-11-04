@@ -15,12 +15,16 @@ class TouchCapture {
     companion object {
         const val TAG = "UScreenTouch"
         const val WS_URL = "ws://127.0.0.1:8891"
+        const val DEFAULT_PORT = 8891
         // MotionEvent.TOOL_TYPE_PALM is @hide, so it has to be spelled out;
         // it is 5 in AOSP (0 unknown, 1 finger, 2 stylus, 3 mouse, 4 eraser,
         // 5 palm). It was 6 here until 1.2.5, so no palm was ever filtered.
         private const val TOOL_TYPE_PALM = 5
         const val RECONNECT_DELAY_MS = 2000L
     }
+
+    /// WebSocket port on 127.0.0.1. Defaults to 8891.
+    @Volatile var port: Int = DEFAULT_PORT
 
     private var webSocket: WebSocket? = null
     @Volatile private var isConnected = false
@@ -191,7 +195,7 @@ class TouchCapture {
     private fun connectWebSocket() {
         webSocket?.cancel()
         val request = Request.Builder()
-            .url(WS_URL)
+            .url("ws://127.0.0.1:$port")
             .build()
         webSocket = client.newWebSocket(request, wsListener)
     }

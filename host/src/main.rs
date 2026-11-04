@@ -256,9 +256,8 @@ async fn run_daemon(cli: Cli) -> Result<()> {
         position: config::Position::parse_or_default(&file_cfg.position),
         ten_bit: file_cfg.ten_bit,
         instance: 0,
-        // With several tablets every helper is pinned to its own card; the
-        // helper's own search would give each of them the same one.
-        card: if file_cfg.max_tablets > 1 { vdisplay::evdi_cards().into_iter().min() } else { None },
+        // Every helper is pinned to its own card by slot instance.
+        card: vdisplay::evdi_cards().first().copied(),
         max_performance_mode,
         hevc_low_latency_tuning: file_cfg.hevc_low_latency_tuning,
     };
@@ -971,33 +970,18 @@ async fn adb_monitor(
     settings_tx: watch::Sender<capture::EncoderSettings>,
     serial_tx: watch::Sender<Option<String>>,
 ) {
-    let mut current: Option<String> = None;
+    let mut slot_0_serial: Option<String> = None;
     let mut last_relaunch = std::time::Instant::now() - std::time::Duration::from_secs(60);
-    // How many times the token has been re-delivered to this tablet. An app
-    // too old to send one fails auth on every reconnect, and without a cap
-    // that is an `am start` every five seconds for as long as it stays
-    // plugged in. Reset whenever a tablet (re)connects.
-    // Exponential backoff rather than a hard cap: after the app is updated
-    // the next delivery must still happen without re-plugging the tablet,
-    // but an app that can never authenticate must not cost an `am start`
-    // every five seconds forever. 5s, 10s, 20s ... up to ten minutes.
     let mut relaunches: u32 = 0;
     let mut relaunch_wait = std::time::Duration::from_secs(5);
     const RELAUNCH_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(600);
-    // Polls since the app process was last checked. A tablet that is plugged
-    // in but whose app has gone (swiped out of recents, killed by Android to
-    // free memory, crashed) used to stay a blank screen until the cable was
-    // pulled and put back; now the app comes back by itself. Checked every
-    // fifth poll, so a missing app costs one `adb shell` every ten seconds.
     let mut polls_since_check: u32 = 0;
     const APP_CHECK_EVERY: u32 = 5;
-    // Said once per disappearance, not every ten seconds.
     let mut wifi_announced = false;
-    // Further tablets, by serial.
     let mut extras: std::collections::HashMap<String, ExtraSession> = std::collections::HashMap::new();
 
     if tokio::process::Command::new("adb").arg("version").output().await.is_err() {
-        error!("adb is not installed — the tablet can never be found. Install android-tools (or adb) and restart.");
+        error!("adb is not installed — devices cannot be found. Install android-tools (or adb) and restart.");
     }
 
     loop {
@@ -1011,13 +995,41 @@ async fn adb_monitor(
                 }
             }
         }
-        let found = pick_device(&devices, current.as_deref()).await;
 
-        match (&current, &found) {
-            // Newly attached, or a different tablet than before.
-            (None, Some(serial)) => {
+        // 1. Check existing sessions: detect disconnected devices with absolute session isolation
+        if let Some(ref s0) = slot_0_serial.clone() {
+            if !devices.contains(s0) {
+                info!("Device on Slot 1 disconnected ({})", s0);
+                if !is_fake_serial(s0) {
+                    teardown_adb_forwarding(s0, video_port, input_port).await;
+                }
+                let _ = tablet_tx.send(false);
+                let _ = serial_tx.send(None);
+                slot_0_serial = None;
+            }
+        }
+
+        let gone_extras: Vec<String> = extras.keys().filter(|k| !devices.contains(k)).cloned().collect();
+        for serial in gone_extras {
+            if let Some(sess) = extras.remove(&serial) {
+                info!("Device on Slot {} disconnected ({})", sess.instance + 1, serial);
+                if !is_fake_serial(&serial) {
+                    teardown_adb_forwarding(&serial, sess.video_port, sess.input_port).await;
+                }
+                sess.stop().await;
+            }
+        }
+
+        // 2. Assign newly attached devices to free slots without disturbing active sessions
+        for serial in &devices {
+            if slot_0_serial.as_ref() == Some(serial) || extras.contains_key(serial) {
+                // Device already has an active, running slot — leave it alone
+                continue;
+            }
+
+            if slot_0_serial.is_none() {
                 info!(
-                    "Tablet connected over {} ({})",
+                    "Device connected on Slot 1 over {} ({})",
                     transport_of(serial).label(),
                     serial
                 );
@@ -1028,70 +1040,20 @@ async fn adb_monitor(
                     on_tablet_connected(serial, video_port, input_port, auto_launch, token.as_deref()).await;
                 }
                 let _ = tablet_tx.send(true);
-                current = found.clone();
+                slot_0_serial = Some(serial.clone());
                 relaunches = 0;
                 relaunch_wait = std::time::Duration::from_secs(5);
-            }
-            (Some(old), Some(serial)) if old != serial => {
-                // Usually not a different tablet at all: pulling the cable on a
-                // tablet that also has `adb tcpip` running swaps one serial for
-                // another on the same device.
-                if transport_of(old) != transport_of(serial) {
-                    info!(
-                        "Tablet moved from {} to {} ({})",
-                        transport_of(old).label(),
-                        transport_of(serial).label(),
-                        serial
-                    );
-                } else {
-                    info!("Different tablet connected ({} → {})", old, serial);
-                }
-                announce_transport(serial);
-                let _ = serial_tx.send(Some(serial.clone()));
-                apply_tablet_profile(serial, &settings_tx).await;
-                on_tablet_connected(serial, video_port, input_port, auto_launch, token.as_deref()).await;
-                let _ = tablet_tx.send(true);
-                current = found.clone();
-                relaunches = 0;
-                relaunch_wait = std::time::Duration::from_secs(5);
-            }
-            (Some(old), None) => {
-                info!("Tablet disconnected ({})", old);
-                let _ = serial_tx.send(None);
-                let _ = tablet_tx.send(false);
-                current = None;
-            }
-            _ => {}
-        }
-
-        // Further tablets. Anything beyond the first that has a free slot.
-        if extra.max_tablets > 1 {
-            let others: Vec<String> = devices.iter().skip(1).cloned().collect();
-            // Gone
-            let gone: Vec<String> = extras.keys().filter(|k| !others.contains(k)).cloned().collect();
-            for serial in gone {
-                if let Some(sess) = extras.remove(&serial) {
-                    info!("Tablet {} disconnected ({})", sess.instance + 1, serial);
-                    sess.stop().await;
-                }
-            }
-            // New
-            for serial in others {
-                if extras.contains_key(&serial) {
-                    continue;
-                }
+            } else if extra.max_tablets > 1 {
                 let used: Vec<u32> = extras.values().map(|s| s.instance).collect();
                 let Some(instance) = (1..extra.max_tablets).find(|i| !used.contains(i)) else {
-                    warn!("Tablet {} attached but all {} slots are taken", serial, extra.max_tablets);
+                    warn!("Device {} attached but all {} slots are taken", serial, extra.max_tablets);
                     continue;
                 };
-                info!("Tablet {} connected over {} ({})", instance + 1, transport_of(&serial).label(), serial);
-                let Some(sess) = spawn_extra_session(&extra, instance, &serial) else {
+                info!("Device connected on Slot {} over {} ({})", instance + 1, transport_of(serial).label(), serial);
+                let Some(sess) = spawn_extra_session(&extra, instance, serial) else {
                     continue;
                 };
-                apply_tablet_profile(&serial, &sess.settings_tx).await;
-                // Remember what this one reports, under its own serial. The
-                // main saver only watches the first tablet's settings.
+                apply_tablet_profile(serial, &sess.settings_tx).await;
                 {
                     let mut rx = sess.settings_tx.subscribe();
                     let serial_for_save = serial.clone();
@@ -1116,14 +1078,12 @@ async fn adb_monitor(
                         }
                     });
                 }
-                let is_fake = std::env::var("USCREEN_FAKE_TABLET")
-                    .map(|f| f.split(',').any(|x| x.trim() == serial))
-                    .unwrap_or(false);
+                let is_fake = is_fake_serial(serial);
                 if !is_fake {
-                    on_tablet_connected(&serial, sess.video_port, sess.input_port, auto_launch, token.as_deref()).await;
+                    on_tablet_connected(serial, sess.video_port, sess.input_port, auto_launch, token.as_deref()).await;
                 }
                 let _ = sess.tablet_tx.send(true);
-                extras.insert(serial, sess);
+                extras.insert(serial.clone(), sess);
             }
         }
 
@@ -1150,7 +1110,7 @@ async fn adb_monitor(
                 // Wi-Fi: try to get it back. adb answers instantly when the
                 // tablet is not reachable, so this costs nothing while it is
                 // off or out of range.
-                if current.is_none() && !wifi_address.is_empty() {
+                if slot_0_serial.is_none() && !wifi_address.is_empty() {
                     let out = tokio::process::Command::new("adb")
                         .args(["connect", &wifi_address])
                         .output()
@@ -1163,7 +1123,7 @@ async fn adb_monitor(
                         }
                     }
                 }
-                let Some(serial) = current.as_deref() else { continue };
+                let Some(serial) = slot_0_serial.as_deref() else { continue };
                 if !auto_launch || is_fake_serial(serial) {
                     continue;
                 }
@@ -1179,14 +1139,14 @@ async fn adb_monitor(
                             "The app is not running on the tablet — launching it again (next try in {:?} if it does not stay up)",
                             (relaunch_wait * 2).min(RELAUNCH_WAIT_MAX)
                         );
-                        launch_app(serial, token.as_deref()).await;
+                        launch_app(serial, token.as_deref(), video_port, input_port).await;
                         relaunch_wait = (relaunch_wait * 2).min(RELAUNCH_WAIT_MAX);
                     }
                     _ => {}
                 }
             }
             _ = relaunch.notified() => {
-                if let Some(serial) = current.as_deref() {
+                if let Some(serial) = slot_0_serial.as_deref() {
                     if last_relaunch.elapsed() >= relaunch_wait {
                         last_relaunch = std::time::Instant::now();
                         relaunches += 1;
@@ -1198,16 +1158,16 @@ async fn adb_monitor(
                             );
                         }
                         info!("Delivering the session token to the app (attempt {}, next in {:?})", relaunches, relaunch_wait.min(RELAUNCH_WAIT_MAX));
-                        launch_app(serial, token.as_deref()).await;
+                        launch_app(serial, token.as_deref(), video_port, input_port).await;
                         relaunch_wait = (relaunch_wait * 2).min(RELAUNCH_WAIT_MAX);
                     }
                 }
             }
             _ = extra_relaunch => {
                 // Deliver the token to every extra tablet; cheap and rare.
-                for (serial, _) in extras.iter() {
-                    if std::env::var("USCREEN_FAKE_TABLET").map(|f| f.split(',').any(|x| x.trim() == serial)).unwrap_or(false) { continue; }
-                    launch_app(serial, token.as_deref()).await;
+                for (serial, sess) in extras.iter() {
+                    if is_fake_serial(serial) { continue; }
+                    launch_app(serial, token.as_deref(), sess.video_port, sess.input_port).await;
                 }
             }
         }
@@ -1426,9 +1386,9 @@ async fn on_tablet_connected(
 ) {
     match setup_adb_forwarding(serial, video_port, input_port).await {
         Ok(_) => {
-            info!("ADB port forwarding set up ({}, {})", video_port, input_port);
+            info!("ADB port forwarding set up (video={}, input={})", video_port, input_port);
             if auto_launch {
-                launch_app(serial, token).await;
+                launch_app(serial, token, video_port, input_port).await;
             }
         }
         Err(e) => warn!("ADB forwarding failed: {}", e),
@@ -1436,17 +1396,13 @@ async fn on_tablet_connected(
 }
 
 /// Start (or re-front) the app, handing it the session token as an intent
-/// extra. The activity is singleTask, so a running app receives it through
-/// onNewIntent rather than being restarted.
-///
-/// The command goes to `adb shell` on stdin, not as arguments. Anything in
-/// argv is readable by every local process for as long as the adb client
-/// runs (/proc/<pid>/cmdline is world-readable), which would hand the token
-/// to exactly the attacker it exists to keep out — and a failed auth on the
-/// control socket can make the daemon spawn this on demand.
-async fn launch_app(serial: &str, token: Option<&str>) {
+/// extra along with unique per-device video and input ports.
+async fn launch_app(serial: &str, token: Option<&str>, video_port: u16, input_port: u16) {
     use tokio::io::AsyncWriteExt;
-    let mut cmd = String::from("am start -n com.uscreen/.MainActivity");
+    let mut cmd = format!(
+        "am start -n com.uscreen/.MainActivity --ei video_port {} --ei input_port {}",
+        video_port, input_port
+    );
     if let Some(t) = token {
         // Hex only, so no quoting is needed and nothing can break out.
         cmd.push_str(" --es token ");
@@ -1542,6 +1498,7 @@ fn is_fake_serial(serial: &str) -> bool {
 /// For a fresh pick, prefer USB over the network, and among USB devices the
 /// one that actually has the app installed: a phone charging next to the
 /// tablet normally does not, and it is almost never the one meant.
+#[allow(dead_code)]
 async fn pick_device(devices: &[String], current: Option<&str>) -> Option<String> {
     if let Some(cur) = current {
         if devices.iter().any(|d| d == cur) {
@@ -1622,6 +1579,7 @@ async fn adb_device_serial() -> Option<String> {
 }
 
 async fn setup_adb_forwarding(serial: &str, video_port: u16, input_port: u16) -> Result<()> {
+    // Forward unique ports directly
     for port in [video_port, input_port] {
         let arg = format!("tcp:{}", port);
         let r = tokio::process::Command::new("adb")
@@ -1636,7 +1594,26 @@ async fn setup_adb_forwarding(serial: &str, video_port: u16, input_port: u16) ->
             );
         }
     }
+    // Also map device localhost 8890/8891 to this device's host ports for fallback
+    let _ = tokio::process::Command::new("adb")
+        .args(["-s", serial, "reverse", "tcp:8890", &format!("tcp:{}", video_port)])
+        .output()
+        .await;
+    let _ = tokio::process::Command::new("adb")
+        .args(["-s", serial, "reverse", "tcp:8891", &format!("tcp:{}", input_port)])
+        .output()
+        .await;
     Ok(())
+}
+
+async fn teardown_adb_forwarding(serial: &str, video_port: u16, input_port: u16) {
+    for port in [video_port, input_port, 8890, 8891] {
+        let arg = format!("tcp:{}", port);
+        let _ = tokio::process::Command::new("adb")
+            .args(["-s", serial, "reverse", "--remove", &arg])
+            .output()
+            .await;
+    }
 }
 
 async fn stop_daemon() -> Result<()> {

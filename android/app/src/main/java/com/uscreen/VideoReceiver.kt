@@ -68,6 +68,9 @@ class VideoReceiver {
     /// codec they are, so guessing wrong means a decoder that never outputs.
     @Volatile var mimeType: String = MIME_TYPE
 
+    /// Host port to connect to for video stream. Defaults to PORT (8890).
+    @Volatile var port: Int = PORT
+
     /// Session token; written as the first 64 bytes on the socket. The host
     /// sends nothing until it has seen it.
     @Volatile var token: String? = null
@@ -480,8 +483,8 @@ class VideoReceiver {
                     continue
                 }
 
-                Log.i(TAG, "Connecting to $HOST:$PORT...")
-                socket = Socket(HOST, PORT).apply {
+                Log.i(TAG, "Connecting to $HOST:$port...")
+                socket = Socket(HOST, port).apply {
                     tcpNoDelay = true
                     soTimeout = 10000 // 10s read timeout
                     // Small on purpose. A 1 MB receive buffer let the host run

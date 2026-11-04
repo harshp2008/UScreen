@@ -57,7 +57,7 @@ class MainActivity : ComponentActivity() {
         applyOrientation()
         videoReceiver = VideoReceiver()
         touchCapture = TouchCapture().also { it.setTouchEnabled(prefs.touchEnabled) }
-        applyToken(intent, restart = false)
+        applyIntentExtras(intent, restart = false)
 
         // Close the host's latency measurement loop: every acknowledged frame
         // lets the host time capture→display on its own clock.
@@ -327,21 +327,37 @@ class MainActivity : ComponentActivity() {
      */
     override fun onNewIntent(intent: android.content.Intent?) {
         super.onNewIntent(intent)
-        intent?.let { applyToken(it, restart = true) }
+        intent?.let { applyIntentExtras(it, restart = true) }
     }
 
-    private fun applyToken(intent: android.content.Intent, restart: Boolean) {
+    private fun applyIntentExtras(intent: android.content.Intent, restart: Boolean) {
         val fromIntent = intent.getStringExtra("token")
         if (fromIntent != null) prefs.hostToken = fromIntent
-        val token = prefs.hostToken ?: return
-        val changed = touchCapture?.token != token
+        val token = prefs.hostToken
+
+        val newVideoPort = intent.getIntExtra("video_port", -1)
+        val newInputPort = intent.getIntExtra("input_port", -1)
+
+        var portChanged = false
+        if (newVideoPort > 0 && videoReceiver?.port != newVideoPort) {
+            Log.i("UScreen", "Assigned unique video port: $newVideoPort")
+            videoReceiver?.port = newVideoPort
+            portChanged = true
+        }
+        if (newInputPort > 0 && touchCapture?.port != newInputPort) {
+            Log.i("UScreen", "Assigned unique input port: $newInputPort")
+            touchCapture?.port = newInputPort
+            portChanged = true
+        }
+
+        if (token == null) return
+        val tokenChanged = touchCapture?.token != token
         touchCapture?.token = token
         videoReceiver?.token = token
-        // Only rebuild live connections. If we are in the background, onStart
-        // will connect with the new token anyway; reconnecting here as well
-        // would leave a second socket behind.
-        if (restart && changed && touchCapture?.isControlConnected() == true) {
-            Log.i("UScreen", "New session token — reconnecting")
+
+        // Only rebuild live connections if token or ports changed
+        if (restart && (tokenChanged || portChanged) && touchCapture?.isControlConnected() == true) {
+            Log.i("UScreen", "Session parameters updated — reconnecting")
             touchCapture?.disconnect()
             touchCapture?.connect()
             if (!penOnlyMode) {

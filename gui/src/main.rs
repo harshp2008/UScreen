@@ -974,8 +974,43 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_secs(1));
         let status = self.status.lock().map(|s| s.clone()).unwrap_or_default();
 
-        // 1. Bottom Panel (persistent apply / discard / status bar)
-        egui::TopBottomPanel::bottom("bottom_bar").show(ctx, |ui| {
+        // 1. Top Panel: Header with Daemon status & PID & Start/Stop control
+        egui::TopBottomPanel::top("header").show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.heading(egui::RichText::new("UScreen").size(18.0).strong());
+                ui.label(egui::RichText::new("USB Virtual Display").weak().size(11.0));
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let btn_text = if status.daemon_running { "Stop Daemon" } else { "Start Daemon" };
+                    if ui.button(btn_text).clicked() {
+                        if status.daemon_running {
+                            match stop_daemon() {
+                                Ok(_) => self.message = "Daemon stopped".into(),
+                                Err(e) => self.message = e,
+                            }
+                        } else {
+                            match start_daemon() {
+                                Ok(_) => self.message = "Daemon starting…".into(),
+                                Err(e) => self.message = e,
+                            }
+                        }
+                    }
+
+                    ui.add_space(10.0);
+                    status_dot(
+                        ui,
+                        status.daemon_running,
+                        if status.daemon_running { "Running" } else { "Stopped" },
+                        &if status.daemon_running { format!("(PID {})", status.daemon_pid) } else { String::new() },
+                    );
+                });
+            });
+            ui.add_space(4.0);
+        });
+
+        // 2. Bottom Panel: Footer with status messages & Apply/Discard actions
+        egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
             ui.add_space(6.0);
             let dirty = self.cfg != self.saved_cfg;
             ui.horizontal(|ui| {
@@ -1001,127 +1036,95 @@ impl eframe::App for App {
             ui.add_space(6.0);
         });
 
-        // 2. Left Navigation Sidebar
-        egui::SidePanel::left("nav_sidebar")
-            .exact_width(210.0)
-            .resizable(false)
+        // 3. Left Navigation Sidebar
+        egui::SidePanel::left("sidebar")
+            .resizable(true)
+            .default_width(220.0)
+            .min_width(180.0)
+            .max_width(320.0)
             .show(ctx, |ui| {
-                ui.add_space(8.0);
-                ui.heading(egui::RichText::new("UScreen").size(22.0));
-                ui.label(egui::RichText::new("USB second display").weak().size(11.0));
-                ui.add_space(8.0);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.add_space(8.0);
+                    // Section 1: Navigation
+                    ui.label(egui::RichText::new("NAVIGATION").strong().size(10.0).color(egui::Color32::from_rgb(140, 140, 150)));
+                    ui.add_space(4.0);
+                    let is_global = self.selected_view == SelectedView::Global;
+                    if ui.add_sized(
+                        egui::vec2(ui.available_width(), 26.0),
+                        egui::Button::selectable(is_global, "🌐  Global Settings"),
+                    ).clicked() {
+                        self.selected_view = SelectedView::Global;
+                    }
 
-                // Daemon status card & Start/Stop
-                egui::Frame::group(ui.style())
-                    .inner_margin(8.0)
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        status_dot(
-                            ui,
-                            status.daemon_running,
-                            if status.daemon_running { "Running" } else { "Stopped" },
-                            &if status.daemon_running { format!("PID {}", status.daemon_pid) } else { String::new() },
-                        );
-                        ui.add_space(4.0);
-                        let btn_text = if status.daemon_running { "Stop Daemon" } else { "Start Daemon" };
-                        let btn_size = egui::vec2(ui.available_width(), 24.0);
-                        if ui.add_sized(btn_size, egui::Button::new(btn_text)).clicked() {
-                            if status.daemon_running {
-                                match stop_daemon() {
-                                    Ok(_) => self.message = "Daemon stopped".into(),
-                                    Err(e) => self.message = e,
-                                }
-                            } else {
-                                match start_daemon() {
-                                    Ok(_) => self.message = "Daemon starting…".into(),
-                                    Err(e) => self.message = e,
-                                }
-                            }
-                        }
-                    });
+                    ui.add_space(14.0);
 
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(6.0);
+                    // Section 2: Devices
+                    ui.label(egui::RichText::new("DEVICES").strong().size(10.0).color(egui::Color32::from_rgb(140, 140, 150)));
+                    ui.add_space(4.0);
 
-                // Section 1: Navigation
-                ui.label(egui::RichText::new("NAVIGATION").strong().size(10.0).color(egui::Color32::from_rgb(140, 140, 150)));
-                ui.add_space(2.0);
-                let is_global = self.selected_view == SelectedView::Global;
-                if ui.add_sized(
-                    egui::vec2(ui.available_width(), 26.0),
-                    egui::Button::selectable(is_global, "🌐  Global Settings"),
-                ).clicked() {
-                    self.selected_view = SelectedView::Global;
-                }
+                    struct DeviceItem {
+                        serial: String,
+                        display_name: String,
+                        connected: bool,
+                        transport: String,
+                    }
+                    let mut device_list: Vec<DeviceItem> = Vec::new();
 
-                ui.add_space(12.0);
-
-                // Section 2: Devices
-                ui.label(egui::RichText::new("DEVICES").strong().size(10.0).color(egui::Color32::from_rgb(140, 140, 150)));
-                ui.add_space(2.0);
-
-                struct DeviceItem {
-                    serial: String,
-                    display_name: String,
-                    connected: bool,
-                    transport: String,
-                }
-                let mut device_list: Vec<DeviceItem> = Vec::new();
-
-                for cd in &status.connected_devices {
-                    let disp = if let Some(p) = self.cfg.tablets.get(&cd.serial) {
-                        p.display_name(&cd.model).to_string()
-                    } else {
-                        cd.model.clone()
-                    };
-                    device_list.push(DeviceItem {
-                        serial: cd.serial.clone(),
-                        display_name: disp,
-                        connected: true,
-                        transport: cd.transport.clone(),
-                    });
-                }
-                for (serial, p) in &self.cfg.tablets {
-                    if !device_list.iter().any(|d| &d.serial == serial) {
+                    for cd in &status.connected_devices {
+                        let disp = if let Some(p) = self.cfg.tablets.get(&cd.serial) {
+                            p.display_name(&cd.model).to_string()
+                        } else {
+                            cd.model.clone()
+                        };
                         device_list.push(DeviceItem {
-                            serial: serial.clone(),
-                            display_name: p.display_name(serial).to_string(),
-                            connected: false,
-                            transport: "Saved".to_string(),
+                            serial: cd.serial.clone(),
+                            display_name: disp,
+                            connected: true,
+                            transport: cd.transport.clone(),
                         });
                     }
-                }
-
-                if device_list.is_empty() {
-                    ui.label(egui::RichText::new("No devices detected").weak().size(11.0));
-                } else {
-                    for dev in device_list {
-                        let is_selected = match &self.selected_view {
-                            SelectedView::Device(s) => s == &dev.serial,
-                            _ => false,
-                        };
-                        let dot = if dev.connected { "●" } else { "○" };
-                        let item_text = format!("{} {} ({})", dot, dev.display_name, dev.transport);
-                        let mut rich = egui::RichText::new(item_text).size(12.0);
-                        if dev.connected {
-                            rich = rich.color(egui::Color32::from_rgb(180, 230, 180));
-                        }
-                        if is_selected {
-                            rich = rich.strong();
-                        }
-                        if ui.add_sized(
-                            egui::vec2(ui.available_width(), 26.0),
-                            egui::Button::selectable(is_selected, rich),
-                        ).clicked() {
-                            self.selected_view = SelectedView::Device(dev.serial.clone());
+                    for (serial, p) in &self.cfg.tablets {
+                        if !device_list.iter().any(|d| &d.serial == serial) {
+                            device_list.push(DeviceItem {
+                                serial: serial.clone(),
+                                display_name: p.display_name(serial).to_string(),
+                                connected: false,
+                                transport: "Saved".to_string(),
+                            });
                         }
                     }
-                }
 
-                // Bottom utility links
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                    ui.add_space(8.0);
+                    if device_list.is_empty() {
+                        ui.label(egui::RichText::new("No devices detected").weak().size(11.0));
+                    } else {
+                        for dev in device_list {
+                            let is_selected = match &self.selected_view {
+                                SelectedView::Device(s) => s == &dev.serial,
+                                _ => false,
+                            };
+                            let dot = if dev.connected { "●" } else { "○" };
+                            let item_text = format!("{} {} ({})", dot, dev.display_name, dev.transport);
+                            let mut rich = egui::RichText::new(item_text).size(12.0);
+                            if dev.connected {
+                                rich = rich.color(egui::Color32::from_rgb(180, 230, 180));
+                            }
+                            if is_selected {
+                                rich = rich.strong();
+                            }
+                            if ui.add_sized(
+                                egui::vec2(ui.available_width(), 26.0),
+                                egui::Button::selectable(is_selected, rich),
+                            ).clicked() {
+                                self.selected_view = SelectedView::Device(dev.serial.clone());
+                            }
+                        }
+                    }
+
+                    ui.add_space(20.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    // Utility links
                     ui.horizontal(|ui| {
                         if ui.small_button("Compatibility").clicked() {
                             let body = format!(
@@ -1145,11 +1148,11 @@ impl eframe::App for App {
                             }
                         });
                     }
-                    ui.separator();
+                    ui.add_space(10.0);
                 });
             });
 
-        // 3. Central Panel (Global View or Device View)
+        // 4. Central Panel: Device or Global Settings
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.add_space(6.0);
@@ -1171,8 +1174,8 @@ impl eframe::App for App {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([680.0, 640.0])
-            .with_min_inner_size([580.0, 500.0])
+            .with_inner_size([760.0, 620.0])
+            .with_min_inner_size([600.0, 480.0])
             .with_app_id("uscreen")
             .with_icon(egui::IconData {
                 rgba: include_bytes!("../../packaging/icons/uscreen-64.rgba").to_vec(),

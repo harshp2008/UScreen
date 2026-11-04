@@ -765,34 +765,20 @@ impl CaptureManager {
     }
 
     #[cfg(not(feature = "inproc-encoder"))]
-    async fn start_encoder(&mut self) -> Result<()> {
-        // Accept the old gstreamer-style name as an alias
-        let encoder = if self.config.encoder == "vaapih264enc" {
-            "h264_vaapi".to_string()
-        } else {
-            self.config.encoder.clone()
+    fn spawn_encoder_child(&self, encoder: &str) -> Result<Child> {
+        let res: Result<()> = match encoder {
+            "h264_nvenc" | "hevc_nvenc" | "h264_vaapi" | "hevc_vaapi" | "libx264" => Ok(()),
+            _ => anyhow::bail!(
+                "Unknown encoder: {}. Use h264_nvenc, hevc_nvenc, h264_vaapi, hevc_vaapi, or libx264",
+                encoder
+            ),
         };
-        // Always the size the helper really emits, never the one we asked for:
-        // a mismatch here shows up as a permanently skewed picture.
+        res?;
+
         let (w, h) = self.active_mode();
-        let n = self.config.stream_scale.max(1);
-        let expected = (
-            ((self.config.width / n) & !1).max(2),
-            ((self.config.height / n) & !1).max(2),
-        );
-        if (w, h) != expected {
-            warn!(
-                "Encoding at {}x{}, expected {}x{} — the compositor did not honour \
-                 the requested mode",
-                w, h, expected.0, expected.1
-            );
-        } else if n > 1 {
-            info!("Encoding at {}x{} (desktop {}x{}, stream scale {})",
-                  w, h, self.config.width, self.config.height, n);
-        }
         let fps = self.config.fps;
         let bitrate = self.config.bitrate;
-        let codec = Codec::from_encoder(&encoder);
+        let codec = Codec::from_encoder(encoder);
         // 10-bit only makes sense on HEVC here: NVENC's H.264 encoder is
         // 8-bit, so asking for it there would silently do nothing.
         let ten_bit = self.config.ten_bit && codec == Codec::Hevc;
@@ -805,7 +791,7 @@ impl CaptureManager {
 
         let mut encoder_args: Vec<String> = vec!["-hide_banner".into()];
 
-        if encoder == "h264_vaapi" {
+        if encoder == "h264_vaapi" || encoder == "hevc_vaapi" {
             encoder_args.extend_from_slice(&[
                 "-vaapi_device".into(),
                 crate::encoders::vaapi_device(),
@@ -851,7 +837,7 @@ impl CaptureManager {
             fifo_path_for(self.config.instance),
         ]);
 
-        if encoder == "h264_vaapi" {
+        if encoder == "h264_vaapi" || encoder == "hevc_vaapi" {
             encoder_args.extend_from_slice(&[
                 "-vf".into(),
                 "format=nv12,hwupload".into(),
@@ -866,7 +852,7 @@ impl CaptureManager {
             encoder_args.extend_from_slice(&["-vf".into(), "format=p010le".into()]);
         }
 
-        encoder_args.extend_from_slice(&["-c:v".into(), encoder.clone()]);
+        encoder_args.extend_from_slice(&["-c:v".into(), encoder.to_string()]);
 
         if encoder.ends_with("_nvenc") {
             let bitrate_m = bitrate as f64 / 1000.0;
@@ -923,7 +909,7 @@ impl CaptureManager {
                     "main10".into(),
                 ]);
             }
-        } else if encoder == "h264_vaapi" {
+        } else if encoder == "h264_vaapi" || encoder == "hevc_vaapi" {
             // Constant quality, for the same reason as NVENC above: a static
             // desktop should cost nothing, and the bitrate is only a ceiling.
             encoder_args.extend_from_slice(&[
@@ -960,7 +946,7 @@ impl CaptureManager {
             ]);
         } else {
             anyhow::bail!(
-                "Unknown encoder: {}. Use h264_nvenc, hevc_nvenc, h264_vaapi, or libx264",
+                "Unknown encoder: {}. Use h264_nvenc, hevc_nvenc, h264_vaapi, hevc_vaapi, or libx264",
                 encoder
             );
         }
@@ -978,7 +964,53 @@ impl CaptureManager {
             .stdin(Stdio::null())
             .kill_on_drop(true);
 
-        let child = cmd.spawn().context("Failed to spawn ffmpeg encoder")?;
+        cmd.spawn().context("Failed to spawn ffmpeg encoder")
+    }
+
+    #[cfg(not(feature = "inproc-encoder"))]
+    async fn start_encoder(&mut self) -> Result<()> {
+        // Accept the old gstreamer-style name as an alias
+        let encoder = if self.config.encoder == "vaapih264enc" {
+            "h264_vaapi".to_string()
+        } else {
+            self.config.encoder.clone()
+        };
+        // Always the size the helper really emits, never the one we asked for:
+        // a mismatch here shows up as a permanently skewed picture.
+        let (w, h) = self.active_mode();
+        let n = self.config.stream_scale.max(1);
+        let expected = (
+            ((self.config.width / n) & !1).max(2),
+            ((self.config.height / n) & !1).max(2),
+        );
+        if (w, h) != expected {
+            warn!(
+                "Encoding at {}x{}, expected {}x{} — the compositor did not honour \
+                 the requested mode",
+                w, h, expected.0, expected.1
+            );
+        } else if n > 1 {
+            info!("Encoding at {}x{} (desktop {}x{}, stream scale {})",
+                  w, h, self.config.width, self.config.height, n);
+        }
+
+        let child = match self.spawn_encoder_child(&encoder) {
+            Ok(child) => child,
+            Err(e) => {
+                if encoder == "hevc_vaapi" {
+                    warn!(
+                        "Encoder hevc_vaapi failed to initialize ({}). Attempting graceful fallback to h264_vaapi",
+                        e
+                    );
+                    self.config.encoder = "h264_vaapi".to_string();
+                    self.spawn_encoder_child("h264_vaapi")
+                        .context("Failed to spawn fallback h264_vaapi encoder")?
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+
         info!("Encoder started (PID: {})", child.id().unwrap_or(0));
         self.encoder_child = Some(child);
         Ok(())
@@ -1227,8 +1259,20 @@ impl CaptureManager {
                 joined = &mut encode_task => {
                     match joined {
                         Ok(Ok(_)) => info!("Encoder finished"),
-                        Ok(Err(e)) => warn!("Encoder error: {}. Restarting...", e),
-                        Err(e) => warn!("Encoder task failed: {}. Restarting...", e),
+                        Ok(Err(e)) => {
+                            warn!("Encoder error: {}. Restarting...", e);
+                            if self.config.encoder == "hevc_vaapi" {
+                                warn!("hevc_vaapi failed during streaming; falling back to h264_vaapi");
+                                self.config.encoder = "h264_vaapi".to_string();
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Encoder task failed: {}. Restarting...", e);
+                            if self.config.encoder == "hevc_vaapi" {
+                                warn!("hevc_vaapi failed during streaming; falling back to h264_vaapi");
+                                self.config.encoder = "h264_vaapi".to_string();
+                            }
+                        }
                     }
                 }
                 _ = settings_rx.changed() => {
@@ -1897,6 +1941,20 @@ mod tests {
         assert_eq!(Codec::from_encoder("libx264"), Codec::H264);
         assert_eq!(Codec::from_encoder("hevc_nvenc"), Codec::Hevc);
         assert_eq!(Codec::from_encoder("hevc_vaapi"), Codec::Hevc);
+    }
+
+    #[test]
+    fn allowed_encoders_include_hevc_vaapi() {
+        let check = |name: &str| -> Result<()> {
+            match name {
+                "h264_nvenc" | "hevc_nvenc" | "h264_vaapi" | "hevc_vaapi" | "libx264" => Ok(()),
+                _ => anyhow::bail!("Unknown encoder: {name}"),
+            }
+        };
+        for name in ["h264_nvenc", "hevc_nvenc", "h264_vaapi", "hevc_vaapi", "libx264"] {
+            assert!(check(name).is_ok());
+        }
+        assert!(check("invalid_enc").is_err());
     }
 
     #[test]

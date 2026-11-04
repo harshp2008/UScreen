@@ -9,6 +9,7 @@ import android.view.View
 import android.view.WindowInsetsController
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.animation.*
 import androidx.compose.foundation.background
@@ -156,7 +157,7 @@ class MainActivity : ComponentActivity() {
 
         // Enable fullscreen AFTER setContent so DecorView exists
         window.decorView.post {
-            enableImmersiveMode()
+            applyImmersiveMode()
         }
     }
 
@@ -248,15 +249,42 @@ class MainActivity : ComponentActivity() {
         tiltListener = null
     }
 
-    private fun enableImmersiveMode() {
+    override fun onResume() {
+        super.onResume()
+        applyImmersiveMode()
+    }
+
+    fun applyImmersiveMode(optIn: Boolean = prefs.immersiveModeEnabled) {
         try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val lp = window.attributes
+                if (optIn) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        lp.layoutInDisplayCutoutMode =
+                            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                    } else {
+                        lp.layoutInDisplayCutoutMode =
+                            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                    }
+                } else {
+                    lp.layoutInDisplayCutoutMode =
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
+                }
+                window.attributes = lp
+            }
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 window.setDecorFitsSystemWindows(false)
                 window.insetsController?.let { controller ->
-                    controller.hide(
-                        android.view.WindowInsets.Type.statusBars() or
-                        android.view.WindowInsets.Type.navigationBars()
-                    )
+                    if (optIn) {
+                        controller.hide(android.view.WindowInsets.Type.systemBars())
+                    } else {
+                        // Original APK behavior: default fullscreen without cutout takeover
+                        controller.hide(
+                            android.view.WindowInsets.Type.statusBars() or
+                            android.view.WindowInsets.Type.navigationBars()
+                        )
+                    }
                     controller.systemBarsBehavior =
                         WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
                 }
@@ -335,7 +363,7 @@ class MainActivity : ComponentActivity() {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) {
-            enableImmersiveMode()
+            applyImmersiveMode()
             // Re-assert once the window is actually attached: a request made in
             // onCreate can be dropped before the window exists.
             requestHighestRefreshRate()
@@ -410,14 +438,28 @@ fun UScreenMain(
     var isConnected by remember { mutableStateOf(false) }
     var fps by remember { mutableStateOf(0f) }
     var mbps by remember { mutableStateOf(0f) }
-    var showOverlay by remember { mutableStateOf(true) }
     var showSettings by remember { mutableStateOf(false) }
     var showStats by remember { mutableStateOf(prefs?.showStats ?: false) }
     var touchOn by remember { mutableStateOf(prefs?.touchEnabled ?: true) }
     var blankInPenMode by remember { mutableStateOf(prefs?.blankPenOnly ?: true) }
     var orientationChoice by remember { mutableStateOf(prefs?.orientation ?: Prefs.ORIENTATION_AUTO) }
+    var immersiveOn by remember { mutableStateOf(prefs?.immersiveModeEnabled ?: false) }
 
     val context = LocalContext.current
+    val activity = context as? MainActivity
+
+    // Only intercept Back button when opt-in immersive mode is ON and streaming or pen mode.
+    // When immersive mode is OFF (Default), Back button behaves as normal Android back (does nothing special).
+    BackHandler(enabled = immersiveOn && (isConnected || penOnly) && !showSettings) {
+        showSettings = true
+    }
+
+    // Re-assert immersive mode whenever settings sheet closes
+    LaunchedEffect(showSettings) {
+        if (!showSettings) {
+            activity?.applyImmersiveMode(immersiveOn)
+        }
+    }
 
     LaunchedEffect(videoReceiver) {
         videoReceiver?.onConnected = {
@@ -425,16 +467,6 @@ fun UScreenMain(
         }
         videoReceiver?.onDisconnected = {
             (context as? ComponentActivity)?.runOnUiThread { isConnected = false }
-        }
-    }
-
-    // Auto-hide overlay shortly after connection
-    LaunchedEffect(isConnected) {
-        if (isConnected) {
-            delay(3000)
-            showOverlay = false
-        } else {
-            showOverlay = true
         }
     }
 
@@ -516,22 +548,48 @@ fun UScreenMain(
             }
         }
 
-        // Subtle settings handle (top-right). Sits above the video surface, so
-        // taps here are NOT forwarded to the Linux host.
-        Box(
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(10.dp)
-                .size(38.dp)
-                // Dimmer still while the screen is blanked: it is the one thing
-                // left lit on an OLED panel.
-                .alpha(if (penOnly && blankInPenMode) 0.18f else if (isConnected) 0.35f else 0.9f)
-                .clip(CircleShape)
-                .background(Color(0xAA20202C))
-                .clickable { showSettings = true },
-            contentAlignment = Alignment.Center
-        ) {
-            Text("⚙", fontSize = 18.sp, color = Color.White)
+        // Settings handle (top-right).
+        // OFF (Default): Always visible, exactly matching the original APK.
+        // ON (Opt-in): Hidden during streaming, visible when disconnected.
+        val showSettingsHandle = !immersiveOn || !isConnected
+
+        if (showSettingsHandle) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(10.dp)
+                    .size(38.dp)
+                    .alpha(if (penOnly && blankInPenMode) 0.18f else if (isConnected) 0.35f else 0.9f)
+                    .clip(CircleShape)
+                    .background(Color(0xAA20202C))
+                    .clickable { showSettings = true },
+                contentAlignment = Alignment.Center
+            ) {
+                Text("⚙", fontSize = 18.sp, color = Color.White)
+            }
+        }
+
+        // "Update available" pill under the settings handle. Small, and gone
+        // the moment there is nothing to say.
+        if (updateAvailable != null && showSettingsHandle) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = 56.dp, end = 10.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Color(0xCC20202C))
+                    .clickable {
+                        context.startActivity(
+                            Intent(
+                                Intent.ACTION_VIEW,
+                                android.net.Uri.parse(UpdateCheck.RELEASES_PAGE)
+                            )
+                        )
+                    }
+                    .padding(horizontal = 10.dp, vertical = 6.dp)
+            ) {
+                Text("Update $updateAvailable available", fontSize = 12.sp, color = Color.White)
+            }
         }
 
         // One-time note after the first successful picture. Dismissable, never
@@ -563,29 +621,6 @@ fun UScreenMain(
                             modifier = Modifier.clickable { onDismissThanks() })
                     }
                 }
-            }
-        }
-
-        // "Update available" pill under the settings handle. Small, and gone
-        // the moment there is nothing to say.
-        if (updateAvailable != null) {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(top = 56.dp, end = 10.dp)
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(Color(0xCC20202C))
-                    .clickable {
-                        context.startActivity(
-                            android.content.Intent(
-                                android.content.Intent.ACTION_VIEW,
-                                android.net.Uri.parse(UpdateCheck.RELEASES_PAGE)
-                            )
-                        )
-                    }
-                    .padding(horizontal = 10.dp, vertical = 6.dp)
-            ) {
-                Text("Update $updateAvailable available", fontSize = 12.sp, color = Color.White)
             }
         }
 
@@ -636,6 +671,15 @@ fun UScreenMain(
                     prefs?.fps = newFps
                     // The one moment the tablet speaks: the user chose these.
                     touchCapture?.sendConfig(bitrateKbps, newFps)
+                },
+                immersiveModeEnabled = immersiveOn,
+                onImmersiveModeEnabledChange = {
+                    immersiveOn = it
+                    prefs?.immersiveModeEnabled = it
+                    activity?.applyImmersiveMode(it)
+                },
+                onExitApp = {
+                    activity?.finish()
                 },
                 onDismiss = { showSettings = false }
             )
@@ -775,6 +819,9 @@ private fun SettingsSheet(
     orientation: Int,
     onOrientationChange: (Int) -> Unit,
     onApply: (bitrateKbps: Int, fps: Int) -> Unit,
+    immersiveModeEnabled: Boolean = false,
+    onImmersiveModeEnabledChange: (Boolean) -> Unit = {},
+    onExitApp: () -> Unit = {},
     onDismiss: () -> Unit,
 ) {
     var bitrateMbps by remember {
@@ -1007,6 +1054,30 @@ private fun SettingsSheet(
                     colors = SwitchDefaults.colors(checkedTrackColor = Accent)
                 )
             }
+            Spacer(Modifier.height(20.dp))
+
+            // Opt-in immersive mode toggle.
+            // OFF (Default): original APK UI with visible settings button and standard Back button behavior.
+            // ON: full-screen immersive with hidden settings button and Back button mapping.
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Enable Immersive Mode (Hide Settings Button)", fontSize = 14.sp, color = Color(0xFFB0B0C0))
+                    Text(
+                        "Hides the gear button and maps the Android Back button to open settings",
+                        fontSize = 11.sp,
+                        color = Color(0xFF6A6A7E)
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Switch(
+                    checked = immersiveModeEnabled,
+                    onCheckedChange = onImmersiveModeEnabledChange,
+                    colors = SwitchDefaults.colors(checkedTrackColor = Accent)
+                )
+            }
             Spacer(Modifier.height(24.dp))
 
             if (!penOnly) {
@@ -1028,6 +1099,17 @@ private fun SettingsSheet(
                     textAlign = TextAlign.Center,
                     modifier = Modifier.fillMaxWidth()
                 )
+            }
+
+            if (immersiveModeEnabled) {
+                Spacer(Modifier.height(16.dp))
+                OutlinedButton(
+                    onClick = onExitApp,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFFF6B6B))
+                ) {
+                    Text("Exit UScreen", fontSize = 14.sp)
+                }
             }
             Spacer(Modifier.height(24.dp))
         }

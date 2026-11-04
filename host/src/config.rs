@@ -148,6 +148,8 @@ pub struct FileConfig {
     /// When enabled and system power profile is "performance", forces 60 FPS stream
     /// even when cursor is on the primary display.
     pub max_performance_mode: bool,
+    /// When enabled, applies aggressive low-latency tuning flags to HEVC VAAPI encoder.
+    pub hevc_low_latency_tuning: bool,
 }
 
 impl Default for FileConfig {
@@ -175,6 +177,7 @@ impl Default for FileConfig {
             input_port: 8891,
             auto_launch_app: true,
             max_performance_mode: false,
+            hevc_low_latency_tuning: true,
         }
     }
 }

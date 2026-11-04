@@ -198,6 +198,8 @@ pub struct CaptureConfig {
     pub card: Option<u32>,
     /// When true and power profile is "performance", forces 60 FPS keepalive stream.
     pub max_performance_mode: bool,
+    /// When true, enables advanced low-latency parameters on HEVC VAAPI encoder.
+    pub hevc_low_latency_tuning: bool,
 }
 
 impl Default for CaptureConfig {
@@ -219,6 +221,7 @@ impl Default for CaptureConfig {
             instance: 0,
             card: None,
             max_performance_mode: false,
+            hevc_low_latency_tuning: true,
         }
     }
 }
@@ -968,6 +971,16 @@ impl CaptureManager {
                     "-profile:v".into(),
                     "main".into(),
                 ]);
+                if self.config.hevc_low_latency_tuning {
+                    encoder_args.extend_from_slice(&[
+                        "-b_depth".into(),
+                        "1".into(),
+                        "-sei".into(),
+                        "0".into(),
+                        "-aud".into(),
+                        "0".into(),
+                    ]);
+                }
             }
         } else if encoder == "libx264" {
             let bufsize_k = (bitrate * 2 / fps.max(1)).max(200);

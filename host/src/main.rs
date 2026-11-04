@@ -260,6 +260,7 @@ async fn run_daemon(cli: Cli) -> Result<()> {
         // helper's own search would give each of them the same one.
         card: if file_cfg.max_tablets > 1 { vdisplay::evdi_cards().into_iter().min() } else { None },
         max_performance_mode,
+        hevc_low_latency_tuning: file_cfg.hevc_low_latency_tuning,
     };
 
     // One secret per daemon run. Handed to the app over adb when it is
@@ -519,6 +520,7 @@ async fn run_daemon(cli: Cli) -> Result<()> {
             instance: 0,
             card: None,
             max_performance_mode,
+            hevc_low_latency_tuning: file_cfg.hevc_low_latency_tuning,
         },
         video_port,
         input_port,

@@ -1183,6 +1183,34 @@ impl CaptureManager {
                 continue;
             }
 
+            // Ensure any exited child processes are reaped and cleared
+            if let Some(ref mut child) = self.helper_child {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        warn!("evdi_helper exited ({}); resetting for respawn", status);
+                        self.helper_child = None;
+                    }
+                    Err(e) => {
+                        warn!("evdi_helper wait error ({}): resetting for respawn", e);
+                        self.helper_child = None;
+                    }
+                    Ok(None) => {}
+                }
+            }
+            if let Some(ref mut child) = self.encoder_child {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        warn!("Encoder process exited ({}); resetting for respawn", status);
+                        self.encoder_child = None;
+                    }
+                    Err(e) => {
+                        warn!("Encoder wait error ({}): resetting for respawn", e);
+                        self.encoder_child = None;
+                    }
+                    Ok(None) => {}
+                }
+            }
+
             // Start evdi-helper if not running
             if self.helper_child.is_none() {
                 if let Err(e) = self.start_helper().await {
@@ -1391,16 +1419,14 @@ impl CaptureManager {
                     if wanted {
                         info!("Tablet is a screen — enabling the virtual display");
                         Self::enable_evdi_display(card, self.config.position).await;
-                        if is_throttled {
-                            is_throttled = false;
-                            if let Some(pid) = self.helper_child.as_ref().and_then(|c| c.id()) {
-                                unsafe {
-                                    libc::kill(pid as libc::pid_t, libc::SIGUSR2);
-                                }
+                        is_throttled = false;
+                        if let Some(pid) = self.helper_child.as_ref().and_then(|c| c.id()) {
+                            unsafe {
+                                libc::kill(pid as libc::pid_t, libc::SIGUSR2);
                             }
-                            self.idr_wanted.store(true, std::sync::atomic::Ordering::SeqCst);
-                            info!("Restored target capture FPS (client active)");
                         }
+                        self.idr_wanted.store(true, std::sync::atomic::Ordering::SeqCst);
+                        info!("Restored target capture FPS and triggered full keyframe refresh (client active)");
                         resume_same_encoder = true;
                     } else {
                         if self.config.keep_alive {
@@ -1438,6 +1464,27 @@ impl CaptureManager {
                     Self::disable_evdi_display(card).await;
                     self.shutdown().await;
                     return Ok(());
+                }
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(1000)) => {
+                    let mut needs_respawn = false;
+                    if let Some(ref mut child) = self.helper_child {
+                        if let Ok(Some(st)) = child.try_wait() {
+                            warn!("evdi_helper exited in background ({}); scheduling respawn", st);
+                            self.helper_child = None;
+                            needs_respawn = true;
+                        }
+                    }
+                    if let Some(ref mut child) = self.encoder_child {
+                        if let Ok(Some(st)) = child.try_wait() {
+                            warn!("Encoder exited in background ({}); scheduling respawn", st);
+                            self.encoder_child = None;
+                            needs_respawn = true;
+                        }
+                    }
+                    if needs_respawn {
+                        break;
+                    }
+                    resume_same_encoder = true;
                 }
             }
 

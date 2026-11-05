@@ -1,8 +1,14 @@
 package com.uscreen
 
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Log
 import android.view.SurfaceView
 import android.view.View
@@ -536,14 +542,14 @@ fun UScreenMain(
             PenOnlyScreen(blankAfterSeconds = if (blankInPenMode) 8 else 0)
         }
 
-        // Connection screen
+        // Connection / State-Aware Onboarding screen
         AnimatedVisibility(
             visible = !isConnected && !penOnly,
             enter = fadeIn(),
             exit = fadeOut(),
             modifier = Modifier.fillMaxSize()
         ) {
-            ConnectionScreen()
+            OnboardingScreen(videoReceiver = videoReceiver)
         }
 
         // Stats chip (top-left, only while streaming)
@@ -757,8 +763,93 @@ private fun PenOnlyScreen(blankAfterSeconds: Int) {
     }
 }
 
+enum class OnboardingStep {
+    DEVELOPER_OPTIONS_DISABLED,
+    USB_DEBUGGING_DISABLED,
+    WAITING_FOR_HOST
+}
+
+private fun getOnboardingStep(context: Context): OnboardingStep {
+    val devEnabled = try {
+        Settings.Global.getInt(context.contentResolver, Settings.Global.DEVELOPMENT_SETTINGS_ENABLED, 0) != 0
+    } catch (_: Exception) {
+        true
+    }
+    if (!devEnabled) return OnboardingStep.DEVELOPER_OPTIONS_DISABLED
+
+    val adbEnabled = try {
+        Settings.Global.getInt(context.contentResolver, Settings.Global.ADB_ENABLED, 0) != 0
+    } catch (_: Exception) {
+        true
+    }
+    if (!adbEnabled) return OnboardingStep.USB_DEBUGGING_DISABLED
+
+    return OnboardingStep.WAITING_FOR_HOST
+}
+
+private fun checkUsbConnected(context: Context): Boolean {
+    val filter = IntentFilter("android.hardware.usb.action.USB_STATE")
+    val intent = context.registerReceiver(null, filter)
+    if (intent != null && intent.getBooleanExtra("connected", false)) {
+        return true
+    }
+    val batteryIntent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+    val plugged = batteryIntent?.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1) ?: -1
+    return plugged == BatteryManager.BATTERY_PLUGGED_USB || plugged == BatteryManager.BATTERY_PLUGGED_AC
+}
+
+private fun checkWifiConnected(context: Context): Boolean {
+    val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+    val net = cm.activeNetwork ?: return false
+    val caps = cm.getNetworkCapabilities(net) ?: return false
+    return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ConnectionScreen() {
+private fun OnboardingScreen(videoReceiver: VideoReceiver?) {
+    val context = LocalContext.current
+    var step by remember { mutableStateOf(getOnboardingStep(context)) }
+    var usbPlugged by remember { mutableStateOf(checkUsbConnected(context)) }
+    var wifiOn by remember { mutableStateOf(checkWifiConnected(context)) }
+    var showHelpWizard by remember { mutableStateOf(false) }
+    var dynamicDiagnostic by remember { mutableStateOf<String?>(null) }
+    var secondsWaiting by remember { mutableStateOf(0) }
+
+    LaunchedEffect(videoReceiver) {
+        videoReceiver?.onDiagnosticUpdate = { diag ->
+            (context as? ComponentActivity)?.runOnUiThread {
+                dynamicDiagnostic = diag
+            }
+        }
+    }
+
+    // Refresh system status periodically
+    LaunchedEffect(Unit) {
+        while (true) {
+            step = getOnboardingStep(context)
+            usbPlugged = checkUsbConnected(context)
+            wifiOn = checkWifiConnected(context)
+            secondsWaiting += 1
+
+            // Dynamic Diagnostics evaluation (Task 3)
+            if (step == OnboardingStep.WAITING_FOR_HOST) {
+                if (usbPlugged) {
+                    if (secondsWaiting > 4 && dynamicDiagnostic == null) {
+                        dynamicDiagnostic = "USB connected, but no data received. Is the cable loose? Try a different port."
+                    }
+                } else if (wifiOn) {
+                    if (secondsWaiting > 4 && dynamicDiagnostic == null) {
+                        dynamicDiagnostic = "Wi-Fi connected, but host unreachable. Are you on the same network?"
+                    }
+                } else {
+                    dynamicDiagnostic = "Connect USB cable or connect to Wi-Fi to reach host."
+                }
+            }
+            delay(1000)
+        }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -769,7 +860,10 @@ private fun ConnectionScreen() {
             ),
         contentAlignment = Alignment.Center
     ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.padding(24.dp)
+        ) {
             Text(
                 text = "UScreen",
                 fontSize = 42.sp,
@@ -777,43 +871,259 @@ private fun ConnectionScreen() {
                 color = Color.White
             )
             Text(
-                text = "USB second display",
+                text = "USB & Wireless Display",
                 fontSize = 15.sp,
                 color = AccentSoft
             )
-            Spacer(modifier = Modifier.height(36.dp))
-            CircularProgressIndicator(
-                color = Accent,
-                strokeWidth = 3.dp,
-                modifier = Modifier.size(40.dp)
-            )
-            Spacer(modifier = Modifier.height(36.dp))
-            Card(
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = Color(0x8C1A1A2A))
-            ) {
-                Column(
-                    modifier = Modifier.padding(horizontal = 28.dp, vertical = 20.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Text(
-                        text = "Waiting for the host…",
-                        fontSize = 16.sp,
-                        color = Warn,
-                        fontWeight = FontWeight.Medium
+            Spacer(modifier = Modifier.height(32.dp))
+
+            when (step) {
+                OnboardingStep.DEVELOPER_OPTIONS_DISABLED -> {
+                    Card(
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0x8C1A1A2A)),
+                        modifier = Modifier.fillMaxWidth(0.85f)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(24.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Text(
+                                text = "Developer Options Required",
+                                fontSize = 18.sp,
+                                color = Warn,
+                                fontWeight = FontWeight.Bold,
+                                textAlign = TextAlign.Center
+                            )
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Text(
+                                text = "UScreen communicates with your PC via Android USB/Wi-Fi debugging. " +
+                                    "Tap 'Build number' 7 times in Device Info to unlock Developer options.",
+                                fontSize = 13.sp,
+                                lineHeight = 20.sp,
+                                color = Color(0xFFB0B0C0),
+                                textAlign = TextAlign.Center
+                            )
+                            Spacer(modifier = Modifier.height(18.dp))
+                            Button(
+                                onClick = {
+                                    try {
+                                        context.startActivity(Intent(Settings.ACTION_DEVICE_INFO_SETTINGS))
+                                    } catch (_: Exception) {
+                                        context.startActivity(Intent(Settings.ACTION_SETTINGS))
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Accent)
+                            ) {
+                                Text("Open Device Info", color = Color.White, fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+                    }
+                }
+                OnboardingStep.USB_DEBUGGING_DISABLED -> {
+                    Card(
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0x8C1A1A2A)),
+                        modifier = Modifier.fillMaxWidth(0.85f)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(24.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Text(
+                                text = "Enable USB Debugging",
+                                fontSize = 18.sp,
+                                color = Warn,
+                                fontWeight = FontWeight.Bold,
+                                textAlign = TextAlign.Center
+                            )
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Text(
+                                text = "Developer options are enabled, but USB debugging is turned off. " +
+                                    "Please turn on 'USB debugging' to allow your PC to connect.",
+                                fontSize = 13.sp,
+                                lineHeight = 20.sp,
+                                color = Color(0xFFB0B0C0),
+                                textAlign = TextAlign.Center
+                            )
+                            Spacer(modifier = Modifier.height(18.dp))
+                            Button(
+                                onClick = {
+                                    try {
+                                        context.startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+                                    } catch (_: Exception) {
+                                        context.startActivity(Intent(Settings.ACTION_SETTINGS))
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Accent)
+                            ) {
+                                Text("Open Developer Options", color = Color.White, fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+                    }
+                }
+                OnboardingStep.WAITING_FOR_HOST -> {
+                    CircularProgressIndicator(
+                        color = Accent,
+                        strokeWidth = 3.dp,
+                        modifier = Modifier.size(40.dp)
                     )
-                    Spacer(modifier = Modifier.height(10.dp))
-                    Text(
-                        text = "1. Connect the USB cable\n" +
-                            "2. Allow USB debugging if asked\n" +
-                            "3. Make sure uscreen is running on your PC",
-                        fontSize = 13.sp,
-                        lineHeight = 22.sp,
-                        color = Color(0xFF9A9AAE),
-                        textAlign = TextAlign.Start
-                    )
+                    Spacer(modifier = Modifier.height(28.dp))
+                    Card(
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0x8C1A1A2A)),
+                        modifier = Modifier.fillMaxWidth(0.85f)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Text(
+                                text = "Waiting for Host…",
+                                fontSize = 17.sp,
+                                color = Color.White,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // Dynamic Diagnostic Message (Task 3)
+                            val diagText = dynamicDiagnostic ?: if (usbPlugged) {
+                                "USB connected, awaiting video stream from PC…"
+                            } else if (wifiOn) {
+                                "Wi-Fi connected, awaiting host connection…"
+                            } else {
+                                "Plug in the USB cable to begin."
+                            }
+
+                            Text(
+                                text = diagText,
+                                fontSize = 13.sp,
+                                lineHeight = 20.sp,
+                                color = if (dynamicDiagnostic != null) Warn else Color(0xFF9A9AAE),
+                                textAlign = TextAlign.Center
+                            )
+
+                            if (secondsWaiting > 6) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = "RSA Fingerprint not accepted? Check your tablet screen for authorization popup.",
+                                    fontSize = 11.sp,
+                                    color = Color(0xFFFFA726),
+                                    textAlign = TextAlign.Center
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(18.dp))
+                            OutlinedButton(
+                                onClick = { showHelpWizard = true },
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentSoft)
+                            ) {
+                                Text("Help Me Fix It 🛠", fontSize = 13.sp)
+                            }
+                        }
+                    }
                 }
             }
+        }
+
+        // Interactive "Help Me Fix It" Wizard (Task 4)
+        if (showHelpWizard) {
+            ModalBottomSheet(
+                onDismissRequest = { showHelpWizard = false },
+                containerColor = Color(0xFF16161F)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .verticalScroll(androidx.compose.foundation.rememberScrollState())
+                        .padding(horizontal = 24.dp, vertical = 12.dp)
+                ) {
+                    Text(
+                        "Connection Troubleshooter",
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Let's verify each requirement step-by-step:",
+                        fontSize = 13.sp,
+                        color = Color(0xFF9A9AB0)
+                    )
+                    Spacer(Modifier.height(16.dp))
+
+                    // Checklist Step 1: Cable
+                    TroubleshootCheckItem(
+                        title = "1. Physical Connection",
+                        detail = if (usbPlugged) "USB cable is securely detected." else "No USB connection detected. Plug in the USB cable.",
+                        passed = usbPlugged
+                    )
+                    Spacer(Modifier.height(12.dp))
+
+                    // Checklist Step 2: Developer Options
+                    val devOn = step != OnboardingStep.DEVELOPER_OPTIONS_DISABLED
+                    TroubleshootCheckItem(
+                        title = "2. Developer Options",
+                        detail = if (devOn) "Developer options enabled." else "Disabled. Must tap Build number 7 times.",
+                        passed = devOn
+                    )
+                    Spacer(Modifier.height(12.dp))
+
+                    // Checklist Step 3: USB Debugging
+                    val adbOn = step == OnboardingStep.WAITING_FOR_HOST
+                    TroubleshootCheckItem(
+                        title = "3. USB Debugging",
+                        detail = if (adbOn) "USB debugging is enabled." else "Disabled. Must toggle in Developer Options.",
+                        passed = adbOn
+                    )
+                    Spacer(Modifier.height(12.dp))
+
+                    // Checklist Step 4: Wi-Fi Fallback
+                    TroubleshootCheckItem(
+                        title = "4. Wi-Fi Network",
+                        detail = if (wifiOn) "Connected to local Wi-Fi." else "Not connected to Wi-Fi.",
+                        passed = wifiOn
+                    )
+
+                    Spacer(Modifier.height(24.dp))
+                    Button(
+                        onClick = {
+                            videoReceiver?.restartSocket()
+                            secondsWaiting = 0
+                            dynamicDiagnostic = "Restarting socket connection…"
+                            showHelpWizard = false
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Accent),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Restart Connection", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                    Spacer(Modifier.height(16.dp))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TroubleshootCheckItem(title: String, detail: String, passed: Boolean) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(Color(0x332A2A3D))
+            .padding(12.dp)
+    ) {
+        Text(
+            text = if (passed) "✓" else "✗",
+            fontSize = 18.sp,
+            fontWeight = FontWeight.Bold,
+            color = if (passed) Color(0xFF4CAF50) else Color(0xFFEF5350),
+            modifier = Modifier.padding(end = 12.dp)
+        )
+        Column {
+            Text(title, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
+            Text(detail, fontSize = 12.sp, color = Color(0xFFB0B0C0))
         }
     }
 }

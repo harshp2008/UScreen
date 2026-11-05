@@ -55,6 +55,19 @@ class VideoReceiver {
 
     var onConnected: (() -> Unit)? = null
     var onDisconnected: (() -> Unit)? = null
+    var onDiagnosticUpdate: ((String) -> Unit)? = null
+
+    fun restartSocket() {
+        synchronized(this) {
+            try {
+                socket?.close()
+            } catch (_: Exception) {}
+            socket = null
+            inputStream = null
+            onDisconnected?.invoke()
+            onDiagnosticUpdate?.invoke("Restarting connection...")
+        }
+    }
 
     /**
      * Invoked with the host's frame sequence number once that frame is
@@ -569,18 +582,28 @@ class VideoReceiver {
                 if (isRunning) {
                     Log.i(TAG, "Stream ended (server closed)")
                     onDisconnected?.invoke()
+                    onDiagnosticUpdate?.invoke("Stream closed by host daemon.")
                     delay(1000)
                 }
             } catch (e: java.net.SocketTimeoutException) {
                 if (isRunning) {
                     Log.w(TAG, "Stream read timeout, reconnecting")
                     onDisconnected?.invoke()
+                    onDiagnosticUpdate?.invoke("USB connected, but no data received. Is the cable loose? Try a different port.")
                     delay(500)
+                }
+            } catch (e: java.net.ConnectException) {
+                if (isRunning) {
+                    Log.w(TAG, "Connection refused: ${e.message}")
+                    onDisconnected?.invoke()
+                    onDiagnosticUpdate?.invoke("Connection refused. Is UScreen running on your PC?")
+                    delay(1000)
                 }
             } catch (e: Exception) {
                 if (isRunning) {
                     Log.e(TAG, "Stream error: ${e.message}")
                     onDisconnected?.invoke()
+                    onDiagnosticUpdate?.invoke(e.message ?: "Connection error")
                     delay(1000)
                 }
             } finally {

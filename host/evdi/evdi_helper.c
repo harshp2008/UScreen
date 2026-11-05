@@ -179,6 +179,7 @@ static int g_grab_n = 0;
 static int g_immediate_n = 0;           /* requests the kernel answered at once */
 static int g_empty_n = 0;               /* grabs that returned no damaged rects */
 static volatile sig_atomic_t g_throttled = 0;
+static void mark_all_dirty(void);
 
 static void handle_signal(int sig) {
     (void)sig;
@@ -191,7 +192,8 @@ static void handle_throttle(int sig) {
         fprintf(stderr, "[evdi-helper] Throttled to 1 FPS (keep-alive standby)\n");
     } else if (sig == SIGUSR2) {
         g_throttled = 0;
-        fprintf(stderr, "[evdi-helper] Resumed normal FPS (client active)\n");
+        mark_all_dirty();
+        fprintf(stderr, "[evdi-helper] Resumed normal FPS and triggered full keyframe refresh (client active)\n");
     }
 }
 

@@ -182,11 +182,27 @@ fn set_autostart(on: bool) -> Result<(), String> {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum DeviceAdbState {
+    Device,
+    Unauthorized,
+    Offline,
+    Failed(String),
+}
+
+impl Default for DeviceAdbState {
+    fn default() -> Self {
+        Self::Offline
+    }
+}
+
 #[derive(Default, Clone, PartialEq, Eq)]
 struct ConnectedDevice {
     serial: String,
     model: String,
     transport: String,
+    adb_state: DeviceAdbState,
+    state_detail: String,
 }
 
 #[derive(Default, Clone)]
@@ -261,17 +277,16 @@ fn poll_status() -> Status {
 
     if let Ok(out) = Command::new("adb").args(["devices", "-l"]).output() {
         let text = String::from_utf8_lossy(&out.stdout);
-        let ready: Vec<&str> = text
-            .lines()
-            .skip(1)
-            .filter(|l| l.split_whitespace().nth(1) == Some("device"))
-            .collect();
-        for line in &ready {
+        for line in text.lines().skip(1) {
             let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.is_empty() {
+                continue;
+            }
             let serial = parts.first().copied().unwrap_or("").to_string();
             if serial.is_empty() {
                 continue;
             }
+            let state_str = parts.get(1).copied().unwrap_or("unknown");
             let model = parts
                 .iter()
                 .find_map(|t| t.strip_prefix("model:"))
@@ -282,13 +297,33 @@ fn poll_status() -> Status {
             } else {
                 "USB".to_string()
             };
+            let (adb_state, state_detail) = match state_str {
+                "device" => (
+                    DeviceAdbState::Device,
+                    "Device connected and authorized. Display stream ready.".to_string(),
+                ),
+                "unauthorized" => (
+                    DeviceAdbState::Unauthorized,
+                    "RSA Fingerprint not accepted. Check your tablet screen.".to_string(),
+                ),
+                "offline" => (
+                    DeviceAdbState::Offline,
+                    "Device is offline. Reconnect the cable or restart ADB.".to_string(),
+                ),
+                other => (
+                    DeviceAdbState::Failed(other.to_string()),
+                    format!("ADB status: {}. Check device cable and permissions.", other),
+                ),
+            };
             s.connected_devices.push(ConnectedDevice {
                 serial,
                 model,
                 transport,
+                adb_state,
+                state_detail,
             });
         }
-        if let Some(first) = s.connected_devices.first() {
+        if let Some(first) = s.connected_devices.iter().find(|d| d.adb_state == DeviceAdbState::Device) {
             s.device_connected = true;
             s.device_model = first.model.clone();
         }
@@ -301,6 +336,8 @@ fn poll_status() -> Status {
                     serial: fake.to_string(),
                     model: model.clone(),
                     transport: "Emulated".to_string(),
+                    adb_state: DeviceAdbState::Device,
+                    state_detail: "Emulated virtual test tablet".to_string(),
                 });
                 s.device_connected = true;
                 if s.device_model.is_empty() {
@@ -740,8 +777,15 @@ impl App {
     fn render_device_settings(&mut self, ui: &mut egui::Ui, serial: &str, status: &Status) {
         let conn = status.connected_devices.iter().find(|t| t.serial == serial);
         let is_connected = conn.is_some();
-        let transport = conn.map(|t| t.transport.as_str()).unwrap_or("Offline");
         let fallback_model = conn.map(|t| t.model.as_str()).unwrap_or(serial);
+        let adb_state = conn.map(|t| t.adb_state.clone()).unwrap_or(DeviceAdbState::Offline);
+        let status_label = match &adb_state {
+            DeviceAdbState::Device => format!("Connected ({})", conn.unwrap().transport),
+            DeviceAdbState::Unauthorized => "Unauthorized (Action Required)".to_string(),
+            DeviceAdbState::Offline => if is_connected { "Device Offline".to_string() } else { "Saved Profile (Offline)".to_string() },
+            DeviceAdbState::Failed(err) => format!("Connection Error ({})", err),
+        };
+        let tooltip_detail = conn.map(|t| t.state_detail.as_str()).unwrap_or("Device is offline. Connect via USB or Wi-Fi to start streaming.");
 
         // Snapshot global defaults before mutably borrowing device profile
         let global_encoder = self.cfg.encoder.clone();
@@ -769,7 +813,7 @@ impl App {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    status_dot(ui, is_connected, if is_connected { format!("Connected ({})", transport) } else { "Saved Profile (Offline)".to_string() }.as_str(), "");
+                    adb_status_dot(ui, &adb_state, &status_label, tooltip_detail);
                     ui.add_space(14.0);
                     ui.label(egui::RichText::new("Serial:").weak().size(11.0));
                     ui.label(egui::RichText::new(serial).strong().size(11.0));
@@ -1099,6 +1143,24 @@ fn status_dot(ui: &mut egui::Ui, on: bool, label: &str, detail: &str) {
     });
 }
 
+fn adb_status_dot(ui: &mut egui::Ui, state: &DeviceAdbState, label: &str, tooltip: &str) {
+    let (color, icon_text) = match state {
+        DeviceAdbState::Device => (egui::Color32::from_rgb(76, 175, 80), "🟢"),
+        DeviceAdbState::Unauthorized => (egui::Color32::from_rgb(255, 179, 0), "⚠"),
+        DeviceAdbState::Offline => (egui::Color32::from_rgb(160, 160, 170), "⚪"),
+        DeviceAdbState::Failed(_) => (egui::Color32::from_rgb(239, 83, 80), "🔴"),
+    };
+    ui.horizontal(|ui| {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 5.0, color);
+        let resp2 = ui.label(egui::RichText::new(format!("{} {}", icon_text, label)).strong());
+        let full_resp = resp.union(resp2);
+        if !tooltip.is_empty() {
+            full_resp.on_hover_text(tooltip);
+        }
+    });
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_secs(1));
@@ -1195,8 +1257,9 @@ impl eframe::App for App {
                     struct DeviceItem {
                         serial: String,
                         display_name: String,
-                        connected: bool,
                         transport: String,
+                        adb_state: DeviceAdbState,
+                        tooltip: String,
                     }
                     let mut device_list: Vec<DeviceItem> = Vec::new();
 
@@ -1209,8 +1272,9 @@ impl eframe::App for App {
                         device_list.push(DeviceItem {
                             serial: cd.serial.clone(),
                             display_name: disp,
-                            connected: true,
                             transport: cd.transport.clone(),
+                            adb_state: cd.adb_state.clone(),
+                            tooltip: cd.state_detail.clone(),
                         });
                     }
                     for (serial, p) in &self.cfg.tablets {
@@ -1218,8 +1282,9 @@ impl eframe::App for App {
                             device_list.push(DeviceItem {
                                 serial: serial.clone(),
                                 display_name: p.display_name(serial).to_string(),
-                                connected: false,
                                 transport: "Saved".to_string(),
+                                adb_state: DeviceAdbState::Offline,
+                                tooltip: "Device offline. Connect via USB or Wi-Fi to start streaming.".to_string(),
                             });
                         }
                     }
@@ -1232,19 +1297,22 @@ impl eframe::App for App {
                                 SelectedView::Device(s) => s == &dev.serial,
                                 _ => false,
                             };
-                            let dot = if dev.connected { "●" } else { "○" };
+                            let (dot, text_color) = match dev.adb_state {
+                                DeviceAdbState::Device => ("🟢", egui::Color32::from_rgb(180, 230, 180)),
+                                DeviceAdbState::Unauthorized => ("⚠", egui::Color32::from_rgb(255, 215, 100)),
+                                DeviceAdbState::Offline => ("⚪", egui::Color32::from_rgb(160, 160, 170)),
+                                DeviceAdbState::Failed(_) => ("🔴", egui::Color32::from_rgb(255, 140, 140)),
+                            };
                             let item_text = format!("{} {} ({})", dot, dev.display_name, dev.transport);
-                            let mut rich = egui::RichText::new(item_text).size(12.0);
-                            if dev.connected {
-                                rich = rich.color(egui::Color32::from_rgb(180, 230, 180));
-                            }
+                            let mut rich = egui::RichText::new(item_text).size(12.0).color(text_color);
                             if is_selected {
                                 rich = rich.strong();
                             }
-                            if ui.add_sized(
+                            let btn = ui.add_sized(
                                 egui::vec2(ui.available_width(), 26.0),
                                 egui::Button::selectable(is_selected, rich),
-                            ).clicked() {
+                            ).on_hover_text(&dev.tooltip);
+                            if btn.clicked() {
                                 self.selected_view = SelectedView::Device(dev.serial.clone());
                             }
                         }

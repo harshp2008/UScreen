@@ -1202,10 +1202,13 @@ async fn adb_monitor(
         // 1. Maintain Slot 0 Session with strict device isolation
         if let Some(ref s0_hw) = slot_0_hw.clone() {
             if let Some(best_dev) = physical_devices.get(s0_hw) {
+                if !*tablet_tx.borrow() {
+                    let _ = tablet_tx.send(true);
+                }
                 // Device is active. Check for seamless USB <-> Wi-Fi handoff for this physical device
                 if best_dev.serial != slot_0_active_serial {
                     info!(
-                        "Seamless handoff: Slot 1 switched transport from {} ({}) to {} ({}) without display teardown",
+                        "[TRANSPORT-SWITCH] Seamless handoff: Slot 1 switched transport from {} ({}) to {} ({}) without display teardown",
                         slot_0_transport.label(), slot_0_active_serial,
                         best_dev.transport.label(), best_dev.serial
                     );
@@ -1240,9 +1243,12 @@ async fn adb_monitor(
         let mut gone_extras = Vec::new();
         for (hw_id, sess) in extras.iter_mut() {
             if let Some(best_dev) = physical_devices.get(hw_id) {
+                if !*sess.tablet_tx.borrow() {
+                    let _ = sess.tablet_tx.send(true);
+                }
                 if best_dev.serial != sess.active_serial {
                     info!(
-                        "Seamless handoff: Slot {} switched transport from {} ({}) to {} ({}) without display teardown",
+                        "[TRANSPORT-SWITCH] Seamless handoff: Slot {} switched transport from {} ({}) to {} ({}) without display teardown",
                         sess.instance + 1,
                         sess.transport.label(), sess.active_serial,
                         best_dev.transport.label(), best_dev.serial
@@ -1402,7 +1408,8 @@ async fn adb_monitor(
                         }
                         Some(false) if slot_0_last_relaunch.elapsed() >= slot_0_relaunch_wait => {
                             slot_0_last_relaunch = std::time::Instant::now();
-                            info!("UScreen app not running on Slot 1 ({}) — launching it", slot_0_active_serial);
+                            info!("UScreen app not running on Slot 1 ({}) — re-verifying port forwarding and launching it", slot_0_active_serial);
+                            let _ = setup_adb_forwarding(&slot_0_active_serial, video_port, input_port).await;
                             launch_app(&slot_0_active_serial, token.as_deref(), video_port, input_port).await;
                             slot_0_relaunch_wait = (slot_0_relaunch_wait * 2).min(RELAUNCH_WAIT_MAX);
                         }
@@ -1420,7 +1427,8 @@ async fn adb_monitor(
                             }
                             Some(false) if sess.last_relaunch.elapsed() >= sess.relaunch_wait => {
                                 sess.last_relaunch = std::time::Instant::now();
-                                info!("UScreen app not running on Slot {} ({}) — launching it", sess.instance + 1, sess.active_serial);
+                                info!("UScreen app not running on Slot {} ({}) — re-verifying port forwarding and launching it", sess.instance + 1, sess.active_serial);
+                                let _ = setup_adb_forwarding(&sess.active_serial, sess.video_port, sess.input_port).await;
                                 launch_app(&sess.active_serial, token.as_deref(), sess.video_port, sess.input_port).await;
                                 sess.relaunch_wait = (sess.relaunch_wait * 2).min(RELAUNCH_WAIT_MAX);
                             }
@@ -1438,6 +1446,7 @@ async fn adb_monitor(
                             warn!("A client keeps connecting without a valid token. Update the UScreen app on the tablet (1.1.0 or newer).");
                         }
                         info!("Delivering session token to Slot 1 app (attempt {}, next in {:?})", slot_0_relaunches, slot_0_relaunch_wait.min(RELAUNCH_WAIT_MAX));
+                        let _ = setup_adb_forwarding(&slot_0_active_serial, video_port, input_port).await;
                         launch_app(&slot_0_active_serial, token.as_deref(), video_port, input_port).await;
                         slot_0_relaunch_wait = (slot_0_relaunch_wait * 2).min(RELAUNCH_WAIT_MAX);
                     }
@@ -1450,6 +1459,7 @@ async fn adb_monitor(
                         sess.last_relaunch = std::time::Instant::now();
                         sess.relaunches += 1;
                         info!("Delivering session token to Slot {} app ({})", sess.instance + 1, sess.active_serial);
+                        let _ = setup_adb_forwarding(&sess.active_serial, sess.video_port, sess.input_port).await;
                         launch_app(&sess.active_serial, token.as_deref(), sess.video_port, sess.input_port).await;
                         sess.relaunch_wait = (sess.relaunch_wait * 2).min(RELAUNCH_WAIT_MAX);
                     }
@@ -1936,23 +1946,47 @@ async fn adb_device_serial() -> Option<String> {
 }
 
 async fn setup_adb_forwarding(serial: &str, video_port: u16, input_port: u16) -> Result<()> {
-    // Forward unique ports directly
+    info!("[ADB-FORWARD] Setting up reverse port forwarding for {} (video={}, input={})", serial, video_port, input_port);
+    // Forward unique ports directly with retry
     for port in [video_port, input_port] {
         let arg = format!("tcp:{}", port);
-        let r = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            tokio::process::Command::new("adb")
-                .args(["-s", serial, "reverse", &arg, &arg])
-                .output(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("adb reverse {} timed out", arg))??;
-        if !r.status.success() {
-            anyhow::bail!(
-                "adb reverse {} failed: {}",
-                arg,
-                String::from_utf8_lossy(&r.stderr).trim()
-            );
+        let mut last_err = String::new();
+        let mut success = false;
+        for attempt in 1..=3 {
+            let r = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tokio::process::Command::new("adb")
+                    .args(["-s", serial, "reverse", &arg, &arg])
+                    .output(),
+            )
+            .await;
+            match r {
+                Ok(Ok(output)) if output.status.success() => {
+                    success = true;
+                    break;
+                }
+                Ok(Ok(output)) => {
+                    last_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                }
+                Ok(Err(e)) => {
+                    last_err = e.to_string();
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                }
+                Err(_) => {
+                    last_err = format!("adb reverse {} timed out", arg);
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                }
+            }
+        }
+        if !success {
+            anyhow::bail!("adb reverse {} failed after 3 attempts: {}", arg, last_err);
         }
     }
     // Only map fallback 8890/8891 for slot 0 to avoid multi-device port cross-talk
@@ -1966,10 +2000,12 @@ async fn setup_adb_forwarding(serial: &str, video_port: u16, input_port: u16) ->
             .output()
             .await;
     }
+    info!("[ADB-FORWARD] Successfully established reverse port forwarding for {}", serial);
     Ok(())
 }
 
 async fn teardown_adb_forwarding(serial: &str, video_port: u16, input_port: u16) {
+    info!("[ADB-FORWARD] Tearing down reverse port forwarding for {} (video={}, input={})", serial, video_port, input_port);
     let mut ports_to_remove = vec![video_port, input_port];
     if video_port == 8890 {
         ports_to_remove.push(8890);

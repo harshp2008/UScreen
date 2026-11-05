@@ -119,6 +119,34 @@ async fn main() -> Result<()> {
     setup_logging();
 
     match &cli.command {
+        Some(Commands::Start { daemonize }) if *daemonize => {
+            let exe = std::env::current_exe()?;
+            let mut cmd = std::process::Command::new(exe);
+            cmd.arg("start");
+            let home = std::env::var("HOME").unwrap_or_default();
+            let log_dir = std::path::PathBuf::from(format!("{}/.local/share/uscreen", home));
+            let _ = std::fs::create_dir_all(&log_dir);
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_dir.join("daemon.log"))?;
+            let log_err = log.try_clone()?;
+            cmd.stdout(log);
+            cmd.stderr(log_err);
+            cmd.stdin(std::process::Stdio::null());
+            #[cfg(unix)]
+            unsafe {
+                use std::os::unix::process::CommandExt;
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                    Ok(())
+                });
+            }
+            let child = cmd.spawn()?;
+            println!("uscreen daemon started in background (PID: {})", child.id());
+            return Ok(());
+        }
         Some(Commands::Start { .. }) | None => {
             info!("Starting uscreen daemon");
             run_daemon(cli).await?;
@@ -145,6 +173,11 @@ fn setup_logging() {
 }
 
 async fn run_daemon(cli: Cli) -> Result<()> {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+
     let pid_path = get_pid_path();
     if let Some(parent) = pid_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -260,6 +293,7 @@ async fn run_daemon(cli: Cli) -> Result<()> {
         card: vdisplay::evdi_cards().first().copied(),
         max_performance_mode,
         hevc_low_latency_tuning: file_cfg.hevc_low_latency_tuning,
+        keep_alive: file_cfg.keep_alive,
     };
 
     // One secret per daemon run. Handed to the app over adb when it is
@@ -312,6 +346,7 @@ async fn run_daemon(cli: Cli) -> Result<()> {
         height_mm: edid::DEFAULT_HEIGHT_MM,
         stream_scale,
         ten_bit: file_cfg.ten_bit,
+        keep_alive: file_cfg.keep_alive,
     });
 
     let mut capture_mgr = capture::CaptureManager::new(cap_config);
@@ -326,7 +361,7 @@ async fn run_daemon(cli: Cli) -> Result<()> {
         mode_tx.clone(),
         latency,
         relaunch.clone(),
-        card_rx,
+        card_rx.clone(),
     );
 
     // Deliberately shallow. This ring is pure latency when it fills: 256 frames
@@ -428,6 +463,28 @@ async fn run_daemon(cli: Cli) -> Result<()> {
     // Which tablet the settings being saved belong to, so they can be
     // remembered per device as well as globally.
     let (serial_tx, serial_rx) = watch::channel(None::<String>);
+
+    // Synchronize app locking with GNOME Shell extension
+    let mut card_rx_applock = card_rx.clone();
+    let mut serial_rx_applock = serial_rx.clone();
+    tokio::spawn(async move {
+        loop {
+            let card_opt = *card_rx_applock.borrow();
+            let conn = card_opt.and_then(|c_idx| {
+                vdisplay::evdi_connectors()
+                    .into_iter()
+                    .find(|c| c.card == c_idx)
+                    .map(|c| c.name)
+            });
+            let serial = serial_rx_applock.borrow().clone();
+            sync_app_lock(conn.as_deref(), serial.as_deref());
+
+            tokio::select! {
+                r = card_rx_applock.changed() => if r.is_err() { break },
+                r = serial_rx_applock.changed() => if r.is_err() { break },
+            }
+        }
+    });
 
     // Persist settings changes pushed at runtime back to the config file
     let serial_rx_save = serial_rx.clone();
@@ -533,6 +590,7 @@ async fn run_daemon(cli: Cli) -> Result<()> {
             card: None,
             max_performance_mode,
             hevc_low_latency_tuning: file_cfg.hevc_low_latency_tuning,
+            keep_alive: file_cfg.keep_alive,
         },
         video_port,
         input_port,
@@ -810,6 +868,9 @@ fn spawn_extra_session(t: &ExtraSessionTemplate, instance: u32, serial: &str) ->
         if let Some(ten_bit) = p.ten_bit {
             cfg.ten_bit = ten_bit;
         }
+        if let Some(keep_alive) = p.keep_alive {
+            cfg.keep_alive = keep_alive;
+        }
         if let Some(ref pos) = p.position {
             cfg.position = config::Position::parse_or_default(pos);
         }
@@ -854,6 +915,7 @@ fn spawn_extra_session(t: &ExtraSessionTemplate, instance: u32, serial: &str) ->
         height_mm: cfg.height_mm,
         stream_scale: cfg.stream_scale,
         ten_bit: cfg.ten_bit,
+        keep_alive: cfg.keep_alive,
     });
     let settings_tx_keep = settings_tx.clone();
     let mut cap = capture::CaptureManager::new(cfg.clone());
@@ -880,7 +942,7 @@ fn spawn_extra_session(t: &ExtraSessionTemplate, instance: u32, serial: &str) ->
         t.mode_tx.clone(),
         latency,
         relaunch.clone(),
-        card_rx,
+        card_rx.clone(),
     );
 
     let (tablet_tx, mut tablet_rx) = watch::channel(false);
@@ -999,13 +1061,57 @@ async fn adb_monitor(
         // 1. Check existing sessions: detect disconnected devices with absolute session isolation
         if let Some(ref s0) = slot_0_serial.clone() {
             if !devices.contains(s0) {
-                info!("Device on Slot 1 disconnected ({})", s0);
-                if !is_fake_serial(s0) {
-                    teardown_adb_forwarding(s0, video_port, input_port).await;
+                let mut handed_off = false;
+                if transport_of(s0) == Transport::Usb {
+                    // USB unplugged: check if we can seamlessly hand off to Wi-Fi without tearing down the EVDI display!
+                    let file_cfg = config::FileConfig::load();
+                    let target_wifi = file_cfg.tablets.get(s0)
+                        .and_then(|p| p.wifi_address.clone())
+                        .or_else(|| if !file_cfg.wifi_address.is_empty() { Some(file_cfg.wifi_address.clone()) } else { None });
+
+                    if let Some(ref wifi_addr) = target_wifi {
+                        let mut wifi_ready = devices.iter().any(|d| d == wifi_addr);
+                        if !wifi_ready {
+                            if let Ok(o) = tokio::process::Command::new("adb").args(["connect", wifi_addr]).output().await {
+                                let said = String::from_utf8_lossy(&o.stdout);
+                                if said.contains("connected") {
+                                    wifi_ready = true;
+                                }
+                            }
+                        }
+                        if wifi_ready {
+                            info!("Seamless handoff: Slot 1 switched from USB ({}) to Wi-Fi ({}) without display teardown", s0, wifi_addr);
+                            if !is_fake_serial(s0) {
+                                teardown_adb_forwarding(s0, video_port, input_port).await;
+                                on_tablet_connected(wifi_addr, video_port, input_port, auto_launch, token.as_deref()).await;
+                            }
+                            slot_0_serial = Some(wifi_addr.clone());
+                            let _ = serial_tx.send(Some(wifi_addr.clone()));
+                            announce_transport(wifi_addr);
+                            handed_off = true;
+                        }
+                    }
                 }
-                let _ = tablet_tx.send(false);
-                let _ = serial_tx.send(None);
-                slot_0_serial = None;
+
+                if !handed_off {
+                    info!("Device on Slot 1 disconnected ({})", s0);
+                    if !is_fake_serial(s0) {
+                        teardown_adb_forwarding(s0, video_port, input_port).await;
+                    }
+                    let _ = tablet_tx.send(false);
+                    let _ = serial_tx.send(None);
+                    slot_0_serial = None;
+                }
+            } else if transport_of(s0) == Transport::Network {
+                // Device currently running over Wi-Fi. Check if a USB device has connected to restore lower latency
+                if let Some(usb) = devices.iter().find(|d| transport_of(d) == Transport::Usb && !is_fake_serial(d)) {
+                    info!("Seamless handoff: USB cable reconnected ({}) — switching from Wi-Fi ({}) to USB for lower latency", usb, s0);
+                    teardown_adb_forwarding(s0, video_port, input_port).await;
+                    on_tablet_connected(usb, video_port, input_port, auto_launch, token.as_deref()).await;
+                    slot_0_serial = Some(usb.clone());
+                    let _ = serial_tx.send(Some(usb.clone()));
+                    announce_transport(usb);
+                }
             }
         }
 
@@ -1038,6 +1144,9 @@ async fn adb_monitor(
                 apply_tablet_profile(serial, &settings_tx).await;
                 if !is_fake_serial(serial) {
                     on_tablet_connected(serial, video_port, input_port, auto_launch, token.as_deref()).await;
+                    if transport_of(serial) == Transport::Usb {
+                        auto_provision_wifi(serial).await;
+                    }
                 }
                 let _ = tablet_tx.send(true);
                 slot_0_serial = Some(serial.clone());
@@ -1081,6 +1190,9 @@ async fn adb_monitor(
                 let is_fake = is_fake_serial(serial);
                 if !is_fake {
                     on_tablet_connected(serial, sess.video_port, sess.input_port, auto_launch, token.as_deref()).await;
+                    if transport_of(serial) == Transport::Usb {
+                        auto_provision_wifi(serial).await;
+                    }
                 }
                 let _ = sess.tablet_tx.send(true);
                 extras.insert(serial.clone(), sess);
@@ -1278,6 +1390,67 @@ async fn tablet_ip(serial: &str) -> Option<String> {
     None
 }
 
+/// Automatically enable `adb tcpip 5555` in the background and discover the device's
+/// local Wi-Fi IP address when connected over USB, saving it for seamless handoff.
+async fn auto_provision_wifi(serial: &str) {
+    if transport_of(serial) != Transport::Usb || is_fake_serial(serial) {
+        return;
+    }
+    let s = serial.to_string();
+    tokio::spawn(async move {
+        let out = tokio::process::Command::new("adb")
+            .args(["-s", &s, "tcpip", "5555"])
+            .output()
+            .await;
+        if out.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+            info!("Auto-enabled adb tcpip 5555 for USB device {}", s);
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if let Some(ip) = tablet_ip(&s).await {
+                let addr = format!("{}:5555", ip);
+                info!("Discovered Wi-Fi address for device {}: {}", s, addr);
+                let mut cfg = config::FileConfig::load();
+                let profile = cfg.tablets.entry(s.clone()).or_default();
+                if profile.wifi_address.is_none() {
+                    profile.wifi_address = Some(addr.clone());
+                    if cfg.wifi_address.is_empty() {
+                        cfg.wifi_address = addr.clone();
+                    }
+                    let _ = cfg.save();
+                }
+                // Pre-connect in background so Wi-Fi transport is hot and ready for handoff
+                let _ = tokio::process::Command::new("adb")
+                    .args(["connect", &addr])
+                    .output()
+                    .await;
+            }
+        }
+    });
+}
+
+/// Synchronize the application window lock state with the GNOME Shell extension via JSON state.
+pub fn sync_app_lock(connector: Option<&str>, serial: Option<&str>) {
+    let cfg = config::FileConfig::load();
+    let apps = serial
+        .and_then(|s| cfg.tablets.get(s))
+        .and_then(|p| p.locked_apps.clone())
+        .unwrap_or(cfg.locked_apps);
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    let dir = std::path::PathBuf::from(home).join(".local/share/uscreen");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("app_lock.json");
+
+    let enabled = !apps.is_empty() && connector.is_some();
+    let json = serde_json::json!({
+        "enabled": enabled,
+        "connector": connector.unwrap_or(""),
+        "locked_apps": apps,
+    });
+    if let Ok(content) = serde_json::to_string_pretty(&json) {
+        let _ = std::fs::write(path, content);
+    }
+}
+
 /// Set up the display this tablet had last time, before anything is built.
 ///
 /// Without it the helper comes up with the previous tablet's mode and EDID,
@@ -1332,6 +1505,7 @@ async fn apply_tablet_profile(serial: &str, settings_tx: &watch::Sender<capture:
     s.stream_scale = p.stream_scale.unwrap_or(cfg.stream_scale).max(1);
     s.encoder = p.encoder.as_ref().filter(|e| !e.trim().is_empty()).cloned().unwrap_or(cfg.encoder.clone());
     s.ten_bit = p.ten_bit.unwrap_or(cfg.ten_bit);
+    s.keep_alive = p.keep_alive.unwrap_or(cfg.keep_alive);
 
     if before == s {
         return;

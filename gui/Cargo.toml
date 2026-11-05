@@ -8,3 +8,4 @@ description = "Settings and status GUI for the uscreen USB display server"
 eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+libc = "0.2"

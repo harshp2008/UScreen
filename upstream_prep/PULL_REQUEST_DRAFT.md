@@ -1,20 +1,24 @@
-# Pull Request: Major Upgrade: HEVC Support, Android Immersive UI, Multi-Device Encoders, and Kernel-Level Pacing Fixes
+# Pull Request: Institutional Upgrade: HEVC Support, Multi-Device UX, Wireless Handoff, Keep-Alive Displays, App Locking, and Daemon Decoupling
 
 ## Title
-**Major Upgrade: HEVC Support, Android Immersive UI, Multi-Device Encoders, and Kernel-Level Pacing Fixes**
+**Institutional Upgrade: HEVC Support, Multi-Device UX, Wireless Handoff, Keep-Alive Displays, App Locking, and Daemon Decoupling**
 
 ---
 
 ## 1. Executive Summary
 
-This Pull Request represents a comprehensive, production-grade architectural upgrade to UScreen, hardening the display server, video pipeline, and Android client for high-performance, low-latency, and multi-device interactive workflows.
+This Pull Request represents a comprehensive, production-grade architectural upgrade to UScreen, hardening the display server, video pipeline, GUI architecture, and Android client for high-performance, low-latency, and multi-device interactive workflows.
 
-Over an intensive multi-phase investigation on modern hardware (Intel Core Ultra Meteor Lake-P / Intel Arc Xe-LPG with Samsung Galaxy Tab S9 FE Exynos 1380), we diagnosed and resolved fundamental systemic bottlenecks spanning Linux kernel DRM interfaces, Mutter Wayland compositor scheduling, FFmpeg hardware acceleration, and Android `MediaCodec` lifecycles.
+Over an intensive multi-phase investigation on modern hardware (Intel Core Ultra Meteor Lake-P / Intel Arc Xe-LPG with Samsung Galaxy Tab S9 FE Exynos 1380 and Samsung Galaxy A55 5G), we diagnosed and resolved fundamental systemic bottlenecks spanning Linux kernel DRM interfaces, Mutter Wayland compositor scheduling, FFmpeg hardware acceleration, POSIX session lifecycles, and Android `MediaCodec` lifecycles.
 
 ### Summary Highlights:
 - **High-Efficiency Video Coding (HEVC / H.265) & 10-bit VAAPI**: Integrated native `hevc_vaapi` hardware encoding with low-latency tuning (`-b_depth 1 -sei 0 -aud 0 -async_depth 1`), unlocking 10-bit precision (HEVC Main10) and cutting stream bandwidth by **~7.6%** to **~15%** while maintaining a locked 90 FPS / 60 FPS.
 - **Architectural Multi-Device UX & Sidebar Navigation**: Completely redesigned `uscreen-gui` from a monolithic scroll list into a modern, responsive Left Sidebar navigation separating Global Configuration from individual Device Views, with persistent pinned status/apply controls.
-- **Comprehensive Per-Device Overrides & Nicknames**: Decoupled ALL settings (Encoder, Frame Rate, Quality, Bitrate, 10-bit Color Depth, Stream Detail / Scale, Screen Position, Custom Resolution) per device with intuitive "Override" / "Inherit Global" toggles. Added user-editable nicknames persisted in `~/.config/uscreen/config.toml` with automatic ADB model fallback.
+- **Comprehensive Per-Device Overrides & Nicknames**: Decoupled ALL settings (Encoder, Frame Rate, Quality, Bitrate, 10-bit Color Depth, Stream Detail / Scale, Screen Position, Custom Resolution, Keep-Alive, App Locking, Wi-Fi Address) per device with intuitive "Override" / "Inherit Global" toggles. Added user-editable nicknames persisted in `~/.config/uscreen/config.toml` with automatic ADB model fallback.
+- **Hidden Wireless Mode Exposure & Seamless Handoff**: Exposed latent Wi-Fi configuration in GUI, enabled autonomous background `adb tcpip 5555` provisioning on USB connection, and engineered seamless transport failover from USB to Wi-Fi ADB without tearing down the EVDI virtual display or restarting Wayland outputs.
+- **Persistent Keep-Alive Virtual Displays**: Added `keep_alive` configuration. When the Android client disconnects, the EVDI handle and Mutter virtual monitor remain active while capture pacing and FFmpeg encoding throttle to 1 FPS via POSIX `SIGUSR1` signalling, resuming instantaneously at 60/90 FPS with IDR keyframes upon reconnect.
+- **App Locking / Filtering per Display**: Built a native ESM GNOME Shell extension (`extensions/uscreen-app-lock/`) communicating via atomic JSON IPC to enforce `locked_apps` per monitor, repelling unauthorized windows back to the primary display under Wayland.
+- **GUI-Daemon Architectural Decoupling**: Solved the critical defect where closing the GUI killed the background daemon. Spawns the daemon via `systemctl --user start uscreen.service` or detached `setsid()` with SIGHUP disarmed and logging redirected to `~/.local/share/uscreen/daemon.log`.
 - **Modernized Device Semantics**: Transitioned GUI and daemon semantics from rigid "Tablet" terminology to universal "Device" semantics supporting phones, foldables, and portable monitors.
 - **Opt-In Android Immersive UI**: Implemented an edge-to-edge full-screen immersive display mode on Android with cutout notch handling, system gesture isolation, and a contextual back-button settings sheet, defaulting strictly to `false` for backwards compatibility.
 - **System-Wide Frame Pacing & Max Performance Mode**: Engineered microsecond-precision hardware capture pacing via POSIX monotonic clocks and high-resolution timer queues, eliminating compositor starvation and adding an optional **Max Performance Mode** to sustain 60/90 FPS independent of primary cursor focus when on AC/performance power profiles.
@@ -58,6 +62,26 @@ Over an intensive multi-phase investigation on modern hardware (Intel Core Ultra
 ### 2.4 Max Performance Mode
 - **Continuous High-Framerate Streaming**: Bypasses compositor idle throttling when the host system power profile is set to `"performance"`.
 - **Virtual Display Keepalive**: Maintains a locked 60/90 FPS stream even when the mouse pointer is operating exclusively on the primary monitor.
+
+### 2.5 Hidden Wireless Mode Exposure & Seamless USB/Wi-Fi Transport Handoff
+- **GUI Exposure**: Added Wi-Fi IP address inputs in both Global and Per-Device settings panels, along with an "Enable Wi-Fi ADB (`tcpip 5555`)" quick-action button in the sidebar.
+- **Autonomous Provisioning**: When any Android device connects via USB, the host daemon automatically triggers background `adb tcpip 5555` provisioning and queries the device's wireless IP via `ip route`.
+- **Hitless Handoff**: When a USB cable is disconnected, the daemon dynamically migrates reverse port tunnels (`adb reverse`) to the device's wireless TCP/IP serial without destroying the EVDI virtual display or resetting the Wayland video pipeline. When USB is re-attached, the daemon seamlessly switches back to USB for minimal latency.
+
+### 2.6 Persistent Keep-Alive Virtual Displays
+- **Schema & Persistence**: Added `keep_alive: Option<bool>` to `TabletProfile` and `FileConfig`, persisted in `~/.config/uscreen/config.toml` with GUI toggle controls.
+- **Standby 1 FPS Throttle**: When `keep_alive` is enabled, client disconnection does not invoke `evdi_destroy` or unmap the Mutter virtual monitor. Instead, `CaptureManager` emits `SIGUSR1` to `evdi_helper`, dynamically throttling frame requests and capture pacing to 1 FPS to minimize CPU and power draw.
+- **Hitless Resumption**: Client reconnection emits `SIGUSR2`, instantly restoring the target 60/90 FPS pacing and requesting an immediate IDR keyframe without compositor reconfiguration.
+
+### 2.7 App Locking & Filtering per Display (GNOME Shell Extension)
+- **Wayland Window Isolation**: Under Wayland, standard client programs cannot inspect or restrict peer window placement. We engineered a native ESM GNOME Shell extension (`extensions/uscreen-app-lock/`) compatible with GNOME Shell 45, 46, and 47.
+- **Zero-Overhead JSON IPC**: The daemon publishes active connector and authorized application IDs (`locked_apps`) to `~/.local/share/uscreen/app_lock.json`, which the extension watches via `Gio.FileMonitor`.
+- **Automatic Monitor Repulsion**: When a window not present in `locked_apps` opens or moves to the UScreen display, the extension intercepts it and immediately relocates it to the primary desktop via `window.move_to_monitor()`.
+
+### 2.8 GUI-Daemon Architectural Decoupling (Critical Bug Fix)
+- **Problem**: Previously, closing the `uscreen-gui` window killed the background daemon and terminated active video streams to all connected tablets.
+- **Root Cause**: Spawning `uscreen start` via standard child processes placed the daemon within the GUI's transient systemd cgroup scope (`app-gnome-*.scope`) without POSIX session detachment. When the GUI closed, systemd delivered `SIGHUP` to the process group, terminating the daemon due to missing SIGHUP handlers.
+- **Fix**: Decoupled the lifecycles completely. `uscreen-gui` now checks for and delegates process supervision to `systemctl --user start uscreen.service`. For standalone installations, it spawns with `setsid()`, disarms `SIGHUP` (`libc::SIG_IGN`), and redirects stdio to `~/.local/share/uscreen/daemon.log`. Closing the GUI has zero impact on active streams.
 
 ---
 
@@ -109,6 +133,10 @@ Through empirical stage-by-stage profiling using a microsecond-resolution shared
 | **Per-Device Encoders** | `"Follow Global Setting"` | Existing single-tablet configs and default setups behave identically to prior releases. |
 | **Android Immersive UI** | **Disabled (Off)** | Preserves legacy status bar and navigation behavior unless explicitly enabled by user. |
 | **Max Performance Mode**| **Disabled (Off)** | Preserves standard power-saving behavior when laptop is on battery. |
+| **Keep-Alive Displays** | **Disabled (`false`)** | Virtual display unmaps on disconnect unless explicitly enabled; throttles to 1 FPS when idle. |
+| **App Locking Extension** | **Disabled (Unfiltered)**| Extension only restricts displays configured with explicit `locked_apps` identifiers. |
+| **Wireless ADB Fallback**| **USB Prioritized** | USB transport is strictly preferred for lowest latency; Wi-Fi activates seamlessly on failover. |
+| **GUI-Daemon Decoupling**| **systemd / detached** | Decoupled via `systemd --user` or POSIX `setsid()`; GUI window closing never kills streaming. |
 | **Compositor Support** | Neutral POSIX timers | Fully tested and verified across **GNOME Wayland**, **KDE Plasma 6**, **Hyprland**, and **COSMIC**. |
 
 ---
@@ -132,13 +160,17 @@ Comprehensive documentation, experimental benchmarks, raw unedited kernel traces
 | [`18_hevc_low_latency_tuning.md`](file:///home/harsh/Documents/GITHUB%20PROJECTS/UScreen/experiments_and_findings/18_hevc_low_latency_tuning.md) | Advanced HEVC Low-Latency Optimization & Exynos Deadlock Resolution |
 | [`19_per_device_encoder_overrides.md`](file:///home/harsh/Documents/GITHUB%20PROJECTS/UScreen/experiments_and_findings/19_per_device_encoder_overrides.md) | Per-Device Hardware Encoder Overrides & Multi-Device Topologies |
 | [`20_multi_device_ux_redesign.md`](file:///home/harsh/Documents/GITHUB%20PROJECTS/UScreen/experiments_and_findings/20_multi_device_ux_redesign.md) | Architectural Multi-Device UX Overhaul, Sidebar Navigation & Full Overrides |
+| [`21_trio_features.md`](file:///home/harsh/Documents/GITHUB%20PROJECTS/UScreen/experiments_and_findings/21_trio_features.md) | UScreen Institutional Trio Features, App Locking, Keep-Alive, & GUI Decoupling |
 
 ---
 
 ## 6. Verification Checklist
 
-- [x] **Backend Unit Tests**: All 41 test cases in `cargo test --workspace` pass with 0 errors.
+- [x] **Backend Unit Tests**: All 42 test cases in `cargo test --workspace` pass with 0 errors.
 - [x] **GUI Compilation**: Built cleanly under release mode and verified with native Wayland/X11 rendering without runtime panics.
+- [x] **GUI Lifecycle Decoupling**: Verified empirically that terminating `uscreen-gui` leaves `uscreen start`, `evdi_helper`, and `ffmpeg` running uninterrupted in the background.
+- [x] **Keep-Alive 1 FPS Standby**: Verified that force-stopping the client app retains the Mutter DRM output and throttles `evdi_helper` to 1 FPS via `SIGUSR1`, instantly resuming upon client restart.
+- [x] **App Locking Extension**: Verified GNOME Shell extension package (`extensions/uscreen-app-lock/`) loads cleanly and synchronizes with `app_lock.json` to move unauthorized windows to the primary display.
 - [x] **Empirical Process Routing**: Verified via `ps aux | grep -E "evdi_helper|ffmpeg"` that Device A (`R52X708AEHK`) runs `hevc_vaapi` at 30 FPS on EVDI card 2 while Device B (`RZCX809Y0FT`) simultaneously runs `h264_vaapi` at 90 FPS on EVDI card 0.
 - [x] **Android Client Validation**: Compiled and tested across Android 12, 13, and 14 with hardware HEVC and H.264 decoders.
 - [x] **End-to-End Latency**: Median encode-to-display latency clocked at **~19.8ms - 20.8ms** with wire transmission at **~4.0ms**.

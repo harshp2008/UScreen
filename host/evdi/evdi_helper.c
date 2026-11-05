@@ -178,9 +178,21 @@ static long long g_grab_sum_us = 0;     /* evdi_grab_pixels duration */
 static int g_grab_n = 0;
 static int g_immediate_n = 0;           /* requests the kernel answered at once */
 static int g_empty_n = 0;               /* grabs that returned no damaged rects */
+static volatile sig_atomic_t g_throttled = 0;
+
 static void handle_signal(int sig) {
     (void)sig;
     g_running = 0;
+}
+
+static void handle_throttle(int sig) {
+    if (sig == SIGUSR1) {
+        g_throttled = 1;
+        fprintf(stderr, "[evdi-helper] Throttled to 1 FPS (keep-alive standby)\n");
+    } else if (sig == SIGUSR2) {
+        g_throttled = 0;
+        fprintf(stderr, "[evdi-helper] Resumed normal FPS (client active)\n");
+    }
 }
 
 /* --- Dynamic Boundary Synchronization (Zero Ghost Cursor & Zero Boundary Lag) --- */
@@ -968,13 +980,15 @@ static int try_open_fifo(void) {
    Zero timer drift, zero frame bursts, and anti-burst drift correction. */
 static void *writer_thread(void *arg) {
     (void)arg;
-    const long long period_ns = 1000000000LL / (g_fps > 0 ? g_fps : 60);
     struct timespec next_frame_time;
     clock_gettime(CLOCK_MONOTONIC, &next_frame_time);
     int have_frame = 0;
     int frame_generation = -1;
 
     while (g_running) {
+        int cur_fps = g_throttled ? 1 : (g_fps > 0 ? g_fps : 60);
+        long long period_ns = 1000000000LL / cur_fps;
+
         if (g_capture_fifo_fd < 0) {
             g_capture_fifo_fd = try_open_fifo();
             if (g_capture_fifo_fd < 0) {
@@ -1135,11 +1149,16 @@ static void run_event_loop(evdi_handle handle) {
     clock_gettime(CLOCK_MONOTONIC, &next_request_time);
 
     while (g_running) {
+        int cur_fps = g_throttled ? 1 : (g_fps > 0 ? g_fps : 60);
+        long long request_period_ns = 1000000000LL / cur_fps;
+
         struct timespec now_ts;
         clock_gettime(CLOCK_MONOTONIC, &now_ts);
         long long due_diff_ns = timespec_diff_ns(&next_request_time, &now_ts);
         int timeout_ms = 4;
-        if (!g_have_mode) {
+        if (g_throttled) {
+            timeout_ms = 50;
+        } else if (!g_have_mode) {
             timeout_ms = 100;
         } else if (g_update_pending) {
             /* Waiting for update_ready from compositor. */
@@ -1322,6 +1341,13 @@ int main(int argc, char *argv[]) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
+
+    struct sigaction sa_th;
+    memset(&sa_th, 0, sizeof(sa_th));
+    sa_th.sa_handler = handle_throttle;
+    sa_th.sa_flags = SA_RESTART;
+    sigaction(SIGUSR1, &sa_th, NULL);
+    sigaction(SIGUSR2, &sa_th, NULL);
 
     /* Reuse an existing EVDI device if one is free (e.g. from a previous
        run) — adding a new DRM card on every restart floods the compositor

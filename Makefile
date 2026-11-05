@@ -41,6 +41,9 @@ install: build edid
 	cp scripts/uscreen.service ${HOME}/.config/systemd/user/ 2>/dev/null || true
 	systemctl --user daemon-reload 2>/dev/null || true
 	@echo "✓ systemd user service installed"
+	mkdir -p ${HOME}/.local/share/gnome-shell/extensions/uscreen-app-lock@uscreen.app/ 2>/dev/null || true
+	cp extensions/uscreen-app-lock/metadata.json extensions/uscreen-app-lock/extension.js ${HOME}/.local/share/gnome-shell/extensions/uscreen-app-lock@uscreen.app/ 2>/dev/null || true
+	@echo "✓ GNOME Shell extension installed: uscreen-app-lock@uscreen.app"
 
 # One-time system setup (needs sudo): pre-create an EVDI device at boot so
 # the daemon never needs root, and load the required modules.

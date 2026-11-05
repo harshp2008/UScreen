@@ -59,6 +59,15 @@ pub struct TabletProfile {
     pub encoder: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ten_bit: Option<bool>,
+    /// Wi-Fi connection endpoint (IP:port) for wireless streaming.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wifi_address: Option<String>,
+    /// Keep virtual display active when tablet disconnects (throttled to 1 FPS).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_alive: Option<bool>,
+    /// Application window locking: allowed apps on this monitor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locked_apps: Option<Vec<String>>,
 }
 
 #[allow(dead_code)]
@@ -173,6 +182,11 @@ pub struct FileConfig {
     pub max_performance_mode: bool,
     /// When enabled, applies aggressive low-latency tuning flags to HEVC VAAPI encoder.
     pub hevc_low_latency_tuning: bool,
+    /// Keep virtual display active when tablet disconnects (throttled to 1 FPS).
+    pub keep_alive: bool,
+    /// Application window locking: allowed apps on the virtual monitor.
+    #[serde(default)]
+    pub locked_apps: Vec<String>,
 }
 
 impl Default for FileConfig {
@@ -201,6 +215,8 @@ impl Default for FileConfig {
             auto_launch_app: true,
             max_performance_mode: false,
             hevc_low_latency_tuning: true,
+            keep_alive: false,
+            locked_apps: Vec::new(),
         }
     }
 }
@@ -416,5 +432,29 @@ position = "left"
 
         p.nickname = Some("Samsung Tab S9 FE".to_string());
         assert_eq!(p.display_name("fallback_serial"), "Samsung Tab S9 FE");
+    }
+
+    #[test]
+    fn test_trio_features_config() {
+        let toml_data = r#"
+keep_alive = true
+locked_apps = ["org.gnome.Nautilus", "google-chrome"]
+wifi_address = "192.168.1.100:5555"
+
+[devices.R52WA0A0KED]
+label = "SM-X616B"
+keep_alive = false
+wifi_address = "192.168.1.150:5555"
+locked_apps = ["com.google.android.youtube"]
+"#;
+        let cfg: FileConfig = toml::from_str(toml_data).expect("parse config with trio features");
+        assert!(cfg.keep_alive);
+        assert_eq!(cfg.wifi_address, "192.168.1.100:5555");
+        assert_eq!(cfg.locked_apps, vec!["org.gnome.Nautilus", "google-chrome"]);
+
+        let p = cfg.tablets.get("R52WA0A0KED").unwrap();
+        assert_eq!(p.keep_alive, Some(false));
+        assert_eq!(p.wifi_address.as_deref(), Some("192.168.1.150:5555"));
+        assert_eq!(p.locked_apps.as_ref().unwrap(), &vec!["com.google.android.youtube"]);
     }
 }

@@ -32,6 +32,12 @@ struct TabletProfile {
     pub encoder: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ten_bit: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wifi_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_alive: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locked_apps: Option<Vec<String>>,
     #[serde(flatten)]
     pub extra: toml::value::Table,
 }
@@ -83,6 +89,9 @@ struct FileConfig {
     auto_launch_app: bool,
     max_performance_mode: bool,
     hevc_low_latency_tuning: bool,
+    keep_alive: bool,
+    #[serde(default)]
+    locked_apps: Vec<String>,
 }
 
 impl Default for FileConfig {
@@ -111,6 +120,8 @@ impl Default for FileConfig {
             auto_launch_app: true,
             max_performance_mode: false,
             hevc_low_latency_tuning: true,
+            keep_alive: false,
+            locked_apps: Vec::new(),
         }
     }
 }
@@ -322,25 +333,60 @@ fn run_system_setup() -> Result<(), String> {
 }
 
 fn start_daemon() -> Result<(), String> {
+    // 1. Try starting via systemd user service if present
+    let service_cat = Command::new("systemctl")
+        .args(["--user", "cat", "uscreen.service"])
+        .output();
+    if let Ok(out) = service_cat {
+        if out.status.success() {
+            let start_out = Command::new("systemctl")
+                .args(["--user", "start", "uscreen.service"])
+                .output();
+            if let Ok(so) = start_out {
+                if so.status.success() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // 2. Direct decoupled spawn with setsid() and SIGHUP disarmed
     let bin = find_uscreen_bin().ok_or("uscreen binary not found — run `make install`")?;
     let log_dir = PathBuf::from(format!("{}/.local/share/uscreen", home()));
     let _ = std::fs::create_dir_all(&log_dir);
-    let log = std::fs::File::create(log_dir.join("daemon.log")).map_err(|e| e.to_string())?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("daemon.log"))
+        .map_err(|e| e.to_string())?;
     let log_err = log.try_clone().map_err(|e| e.to_string())?;
-    let mut child = Command::new(bin)
-        .arg("start")
-        .stdout(log)
-        .stderr(log_err)
-        .stdin(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Failed to start daemon: {}", e))?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
+
+    let mut cmd = Command::new(bin);
+    cmd.arg("start");
+    cmd.stdout(log);
+    cmd.stderr(log_err);
+    cmd.stdin(std::process::Stdio::null());
+
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setsid();
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+
+    cmd.spawn().map_err(|e| format!("Failed to start daemon: {}", e))?;
     Ok(())
 }
 
 fn stop_daemon() -> Result<(), String> {
+    // Try stopping systemd service first
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", "uscreen.service"])
+        .output();
+
     let bin = find_uscreen_bin().ok_or("uscreen binary not found")?;
     Command::new(bin)
         .arg("stop")
@@ -661,6 +707,33 @@ impl App {
                     );
                 });
                 ui.end_row();
+
+                ui.label("Keep-Alive Display");
+                ui.vertical(|ui| {
+                    ui.checkbox(&mut self.cfg.keep_alive, "Keep virtual display active when disconnected");
+                    ui.label(egui::RichText::new("Preserves virtual monitors and windows when a device disconnects; throttles capture to 1 FPS.").weak().size(11.0));
+                });
+                ui.end_row();
+
+                ui.label("Wireless Connection");
+                ui.vertical(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.cfg.wifi_address).hint_text("e.g. 192.168.1.50:5555"));
+                    ui.label(egui::RichText::new("Default IP:5555 for automatic wireless fallback when USB cable is disconnected.").weak().size(11.0));
+                });
+                ui.end_row();
+
+                ui.label("App Locking (Mutter)");
+                ui.vertical(|ui| {
+                    let mut apps_str = self.cfg.locked_apps.join(", ");
+                    if ui.add(egui::TextEdit::singleline(&mut apps_str).hint_text("e.g. org.gnome.Nautilus, google-chrome")).changed() {
+                        self.cfg.locked_apps = apps_str.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                    }
+                    ui.label(egui::RichText::new("Allowed apps on virtual display. Non-matching windows are automatically repelled to the primary display.").weak().size(11.0));
+                });
+                ui.end_row();
             });
     }
 
@@ -916,6 +989,63 @@ impl App {
                         ui.add(egui::DragValue::new(&mut profile.height).range(0..=8192).speed(8));
                     });
                     ui.label(egui::RichText::new("0 × 0 uses device auto-negotiated panel resolution.").weak().size(11.0));
+                });
+                ui.end_row();
+
+                // 9. Wireless Connection
+                ui.label("Wireless Connection");
+                ui.vertical(|ui| {
+                    let mut addr = profile.wifi_address.clone().unwrap_or_default();
+                    if ui.add(egui::TextEdit::singleline(&mut addr).hint_text("e.g. 192.168.1.50:5555")).changed() {
+                        profile.wifi_address = if addr.trim().is_empty() { None } else { Some(addr) };
+                    }
+                    ui.horizontal(|ui| {
+                        if is_connected && ui.small_button("Enable Wi-Fi ADB (tcpip 5555)").clicked() {
+                            let s = serial.to_string();
+                            std::thread::spawn(move || {
+                                let _ = std::process::Command::new("adb").args(["-s", &s, "tcpip", "5555"]).output();
+                            });
+                        }
+                    });
+                    ui.label(egui::RichText::new("When USB is unplugged, UScreen seamlessly transfers the session to Wi-Fi without tearing down the virtual display.").weak().size(11.0));
+                });
+                ui.end_row();
+
+                // 10. Keep-Alive Display Override
+                ui.label("Keep-Alive Display");
+                ui.vertical(|ui| {
+                    let mut is_overridden = profile.keep_alive.is_some();
+                    if ui.checkbox(&mut is_overridden, "Override Keep-Alive").changed() {
+                        profile.keep_alive = if is_overridden { Some(self.cfg.keep_alive) } else { None };
+                    }
+                    if let Some(ref mut ka) = profile.keep_alive {
+                        ui.checkbox(ka, "Keep virtual display active when disconnected");
+                        ui.label(egui::RichText::new("Preserves monitor and window layout; throttles capture to 1 FPS while away.").weak().size(11.0));
+                    } else {
+                        ui.label(egui::RichText::new(format!("Using Global ({})", if self.cfg.keep_alive { "Enabled" } else { "Disabled" })).weak().size(11.0));
+                    }
+                });
+                ui.end_row();
+
+                // 11. Application Locking Override
+                ui.label("App Locking (Mutter)");
+                ui.vertical(|ui| {
+                    let mut is_overridden = profile.locked_apps.is_some();
+                    if ui.checkbox(&mut is_overridden, "Override App Locking").changed() {
+                        profile.locked_apps = if is_overridden { Some(self.cfg.locked_apps.clone()) } else { None };
+                    }
+                    if let Some(ref mut apps) = profile.locked_apps {
+                        let mut apps_str = apps.join(", ");
+                        if ui.add(egui::TextEdit::singleline(&mut apps_str).hint_text("e.g. org.gnome.Nautilus, google-chrome")).changed() {
+                            *apps = apps_str.split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                        }
+                        ui.label(egui::RichText::new("Only windows matching these application IDs will stay on this monitor. Others are repelled.").weak().size(11.0));
+                    } else {
+                        ui.label(egui::RichText::new(format!("Using Global ({} app{})", self.cfg.locked_apps.len(), if self.cfg.locked_apps.len() == 1 { "" } else { "s" })).weak().size(11.0));
+                    }
                 });
                 ui.end_row();
             });

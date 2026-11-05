@@ -127,6 +127,7 @@ pub struct EncoderSettings {
     /// Integer downscale for the stream; see `config::FileConfig::stream_scale`.
     pub stream_scale: u32,
     pub ten_bit: bool,
+    pub keep_alive: bool,
 }
 
 /// Why the helper cannot get an EVDI device, in the words of someone who can
@@ -201,6 +202,8 @@ pub struct CaptureConfig {
     pub max_performance_mode: bool,
     /// When true, enables advanced low-latency parameters on HEVC VAAPI encoder.
     pub hevc_low_latency_tuning: bool,
+    /// Keep virtual display active when tablet disconnects, throttled to 1 FPS.
+    pub keep_alive: bool,
 }
 
 impl Default for CaptureConfig {
@@ -223,6 +226,7 @@ impl Default for CaptureConfig {
             card: None,
             max_performance_mode: false,
             hevc_low_latency_tuning: true,
+            keep_alive: false,
         }
     }
 }
@@ -1099,6 +1103,7 @@ impl CaptureManager {
         // Frame size the running encoder was configured for, so a later mode
         // change can be detected as a mismatch rather than silently skewing.
         let mut encoder_mode: Option<(u32, u32)> = None;
+        let mut is_throttled = false;
 
         loop {
             // Apply the latest runtime settings before (re)starting anything
@@ -1142,6 +1147,7 @@ impl CaptureManager {
                 self.config.height_mm = s.height_mm;
                 self.config.stream_scale = s.stream_scale;
                 self.config.ten_bit = s.ten_bit;
+                self.config.keep_alive = s.keep_alive;
             }
 
             // No tablet being used as a screen: no helper, and so no EVDI
@@ -1153,7 +1159,8 @@ impl CaptureManager {
             // black and no tablet in sight (#12). Starting the helper only
             // while a tablet is attached makes the virtual monitor appear and
             // disappear exactly like a cable being plugged in and out.
-            if !*display_rx.borrow() {
+            // If keep_alive is set, the helper and display are preserved.
+            if !*display_rx.borrow() && !self.config.keep_alive {
                 if let Some(mut h) = self.helper_child.take() {
                     info!("No tablet is a screen — disconnecting the virtual display");
                     let _ = h.start_kill();
@@ -1378,15 +1385,38 @@ impl CaptureManager {
                     if wanted {
                         info!("Tablet is a screen — enabling the virtual display");
                         Self::enable_evdi_display(card, self.config.position).await;
+                        if is_throttled {
+                            is_throttled = false;
+                            if let Some(pid) = self.helper_child.as_ref().and_then(|c| c.id()) {
+                                unsafe {
+                                    libc::kill(pid as libc::pid_t, libc::SIGUSR2);
+                                }
+                            }
+                            self.idr_wanted.store(true, std::sync::atomic::Ordering::SeqCst);
+                            info!("Restored target capture FPS (client active)");
+                        }
                         resume_same_encoder = true;
                     } else {
-                        // Disable first so KWin moves the windows off it, then
-                        // fall through to the teardown: the helper goes away
-                        // with the session, and the top of the outer loop
-                        // waits for a tablet before bringing anything back.
-                        info!("Tablet is not a screen — disabling the virtual display");
-                        Self::disable_evdi_display(card).await;
-                        display_dropped = true;
+                        if self.config.keep_alive {
+                            info!("Tablet disconnected but keep_alive is enabled — maintaining virtual display and throttling capture to 1 FPS");
+                            if !is_throttled {
+                                is_throttled = true;
+                                if let Some(pid) = self.helper_child.as_ref().and_then(|c| c.id()) {
+                                    unsafe {
+                                        libc::kill(pid as libc::pid_t, libc::SIGUSR1);
+                                    }
+                                }
+                            }
+                            resume_same_encoder = true;
+                        } else {
+                            // Disable first so KWin moves the windows off it, then
+                            // fall through to the teardown: the helper goes away
+                            // with the session, and the top of the outer loop
+                            // waits for a tablet before bringing anything back.
+                            info!("Tablet is not a screen — disabling the virtual display");
+                            Self::disable_evdi_display(card).await;
+                            display_dropped = true;
+                        }
                     }
                 }
                 _ = shutdown_rx.changed() => {

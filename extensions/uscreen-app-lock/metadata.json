@@ -1,0 +1,8 @@
+{
+  "name": "UScreen App Lock",
+  "description": "Restricts and enforces application window placement on the UScreen virtual display",
+  "uuid": "uscreen-app-lock@uscreen.app",
+  "shell-version": ["42", "43", "44", "45", "46", "47"],
+  "version": 2,
+  "url": "https://github.com/majmichu1/UScreen"
+}

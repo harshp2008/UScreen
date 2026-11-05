@@ -31,6 +31,10 @@ install: build edid
 	cp target/release/uscreen-gui $(BIN_DIR)/uscreen-gui
 	cp host/evdi/evdi_helper $(BIN_DIR)/evdi_helper
 	cp edid/s9ultra.bin $(DATA_DIR)/edid/
+	@if [ -f android/app/build/outputs/apk/debug/app-debug.apk ]; then \
+		cp android/app/build/outputs/apk/debug/app-debug.apk $(DATA_DIR)/app-debug.apk; \
+		echo "✓ Installed APK to $(DATA_DIR)/app-debug.apk"; \
+	fi
 	@echo "✓ Installed to $(BIN_DIR)/uscreen, $(BIN_DIR)/uscreen-gui and $(BIN_DIR)/evdi_helper"
 	mkdir -p ${HOME}/.local/share/applications
 	cp scripts/uscreen.desktop ${HOME}/.local/share/applications/ 2>/dev/null || true

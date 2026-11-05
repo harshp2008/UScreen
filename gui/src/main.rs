@@ -266,22 +266,59 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn install_apk(serial: &str) -> Result<String, String> {
+fn find_apk_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    // 1. Check local share directory (standard user install location)
     let h = home();
-    let candidates = [
-        PathBuf::from("android/app/build/outputs/apk/debug/app-debug.apk"),
-        PathBuf::from(format!("{}/Documents/GITHUB PROJECTS/UScreen/android/app/build/outputs/apk/debug/app-debug.apk", h)),
-        PathBuf::from("/usr/share/uscreen/app-debug.apk"),
-        PathBuf::from(format!("{}/.local/share/uscreen/app-debug.apk", h)),
-    ];
-    let apk = candidates.iter().find(|p| p.exists())
-        .ok_or_else(|| "app-debug.apk not found. Please build it first with `./gradlew assembleDebug`.".to_string())?;
+    if !h.is_empty() {
+        candidates.push(PathBuf::from(format!("{}/.local/share/uscreen/app-debug.apk", h)));
+    }
+
+    // 2. Check system-wide installation directory
+    candidates.push(PathBuf::from("/usr/share/uscreen/app-debug.apk"));
+    candidates.push(PathBuf::from("/usr/local/share/uscreen/app-debug.apk"));
+
+    // 3. Resolve relative to the current executable's directory (traversing up to find android/app/build)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Ok(real_exe) = std::fs::canonicalize(exe) {
+            let mut cur = real_exe.parent();
+            for _ in 0..5 {
+                if let Some(parent) = cur {
+                    let p = parent.join("android/app/build/outputs/apk/debug/app-debug.apk");
+                    candidates.push(p);
+                    cur = parent.parent();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    // 4. Check known project paths in home directory
+    if !h.is_empty() {
+        candidates.push(PathBuf::from(format!("{}/Documents/GITHUB PROJECTS/UScreen/android/app/build/outputs/apk/debug/app-debug.apk", h)));
+        candidates.push(PathBuf::from(format!("{}/UScreen/android/app/build/outputs/apk/debug/app-debug.apk", h)));
+        candidates.push(PathBuf::from(format!("{}/src/UScreen/android/app/build/outputs/apk/debug/app-debug.apk", h)));
+    }
+
+    // 5. Check relative to current working directory
+    candidates.push(PathBuf::from("android/app/build/outputs/apk/debug/app-debug.apk"));
+    candidates.push(PathBuf::from("app-debug.apk"));
+
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+fn install_apk(serial: &str) -> Result<String, String> {
+    let apk = find_apk_path().ok_or_else(|| {
+        "app-debug.apk not found. Build it with `./gradlew assembleDebug` or place in ~/.local/share/uscreen/app-debug.apk".to_string()
+    })?;
     let out = Command::new("adb")
         .args(["-s", serial, "install", "-r", &apk.to_string_lossy()])
         .output()
         .map_err(|e| format!("Failed to run adb install: {}", e))?;
     if out.status.success() {
-        Ok(format!("Installed APK on {}", serial))
+        Ok(format!("Successfully installed APK on {}", serial))
     } else {
         Err(format!("Install failed: {}", String::from_utf8_lossy(&out.stderr).trim()))
     }
@@ -1458,15 +1495,26 @@ impl eframe::App for App {
                         SelectedView::Device(s) => Some(s.clone()),
                         _ => status.connected_devices.iter().find(|d| d.adb_state == DeviceAdbState::Device).map(|d| d.serial.clone()),
                     };
-                    if let Some(ref s) = target_serial {
-                        if ui.add_sized(
-                            egui::vec2(ui.available_width(), 26.0),
-                            egui::Button::new("📲  Install Android App"),
-                        ).on_hover_text(format!("Push latest app-debug.apk to {}", s)).clicked() {
+                    let apk_opt = find_apk_path();
+                    let tooltip = match (&target_serial, &apk_opt) {
+                        (Some(s), Some(p)) => format!("Push {} to {}", p.display(), s),
+                        (Some(s), None) => format!("Warning: APK not found. Cannot push to {}", s),
+                        (None, Some(p)) => format!("Found {}. Connect a device via USB to install.", p.display()),
+                        (None, None) => "Warning: app-debug.apk not found and no active Android device connected.".to_string(),
+                    };
+                    if ui.add_sized(
+                        egui::vec2(ui.available_width(), 26.0),
+                        egui::Button::new("📲  Install Android App"),
+                    ).on_hover_text(tooltip).clicked() {
+                        if let Some(ref s) = target_serial {
                             match install_apk(s) {
                                 Ok(msg) => self.message = msg,
                                 Err(err) => self.message = err,
                             }
+                        } else if apk_opt.is_none() {
+                            self.message = "Error: app-debug.apk not found. Please build it (`cd android && ./gradlew assembleDebug`) or copy to ~/.local/share/uscreen/app-debug.apk".to_string();
+                        } else {
+                            self.message = "No authorized Android device connected. Please connect your tablet with USB debugging enabled.".to_string();
                         }
                     }
 
@@ -1539,4 +1587,28 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_apk_path_resolves() {
+        let apk = find_apk_path();
+        println!("Resolved APK path: {:?}", apk);
+        assert!(apk.is_some(), "find_apk_path() must locate app-debug.apk");
+        assert!(apk.unwrap().exists());
+    }
+
+    #[test]
+    fn test_find_apk_path_from_root_dir() {
+        let orig = std::env::current_dir().unwrap();
+        let _ = std::env::set_current_dir("/");
+        let apk = find_apk_path();
+        let _ = std::env::set_current_dir(orig);
+        println!("Resolved APK path from /: {:?}", apk);
+        assert!(apk.is_some(), "find_apk_path() must locate app-debug.apk even when cwd is /");
+        assert!(apk.unwrap().exists());
+    }
 }

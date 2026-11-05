@@ -163,6 +163,13 @@ install_files() {
     chmod +x "$BIN_DIR/uscreen" "$BIN_DIR/evdi_helper"
     info "Binaries installed to $BIN_DIR"
 
+    DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/uscreen"
+    mkdir -p "$DATA_DIR"
+    if [ -f "$PROJECT_DIR/android/app/build/outputs/apk/debug/app-debug.apk" ]; then
+        cp "$PROJECT_DIR/android/app/build/outputs/apk/debug/app-debug.apk" "$DATA_DIR/app-debug.apk"
+        info "APK copied to $DATA_DIR/app-debug.apk"
+    fi
+
     # Absolute path: the app menu does not necessarily have ~/.local/bin on
     # its PATH, so a bare "uscreen-gui" can be a menu entry that does nothing.
     sed "s|^Exec=.*|Exec=$BIN_DIR/uscreen-gui|" "$SCRIPT_DIR/uscreen.desktop" > "$APP_DIR/uscreen.desktop" \

@@ -1157,10 +1157,10 @@ private fun OnboardingScreen(videoReceiver: VideoReceiver?) {
             val adbOn = step == OnboardingStep.WAITING_FOR_HOST
             val transportOk = usbPlugged || wifiOn
 
-            // Auto-dismiss and reconnect when all prerequisites become true (8s hold for modal inspection)
+            // Auto-dismiss and reconnect when all prerequisites become true (standard 2000ms UX window)
             LaunchedEffect(transportOk, devOn, adbOn) {
                 if (transportOk && devOn && adbOn) {
-                    delay(8000)
+                    delay(2000)
                     videoReceiver?.restartSocket()
                     showHelpWizard = false
                 }

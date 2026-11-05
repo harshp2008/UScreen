@@ -31,6 +31,7 @@ pub fn make_edid_sized(
     refresh: u32,
     width_mm: u32,
     height_mm: u32,
+    serial_id: u32,
 ) -> Vec<u8> {
     let mut edid = vec![0u8; 128];
 
@@ -42,9 +43,11 @@ pub fn make_edid_sized(
     edid[8] = b8;
     edid[9] = b9;
 
-    // Product code / serial
+    // Product code / serial. Unique serial per instance prevents Mutter / KWin
+    // from aliasing multiple virtual screens to the same physical device.
     edid[10] = 0x01;
-    edid[12..16].copy_from_slice(&1u32.to_le_bytes());
+    let s_id = if serial_id == 0 { 1 } else { serial_id };
+    edid[12..16].copy_from_slice(&s_id.to_le_bytes());
 
     edid[16] = 0; // week
     edid[17] = 34; // year (2024-1990)
@@ -149,13 +152,15 @@ pub fn ensure_edid_sized(
     refresh: u32,
     width_mm: u32,
     height_mm: u32,
+    serial_id: u32,
 ) -> Result<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     let dir = PathBuf::from(home).join(".local/share/uscreen/edid");
     std::fs::create_dir_all(&dir).context("create EDID dir")?;
+    let s_id = if serial_id == 0 { 1 } else { serial_id };
     let path = dir.join(format!(
-        "auto-v{}-{}x{}@{}-{}x{}mm.bin",
-        EDID_GENERATION, width, height, refresh, width_mm, height_mm
+        "auto-v{}-s{}-{}x{}@{}-{}x{}mm.bin",
+        EDID_GENERATION, s_id, width, height, refresh, width_mm, height_mm
     ));
     if !path.exists() {
         // Written next to its final name and renamed into place: a crash
@@ -165,17 +170,18 @@ pub fn ensure_edid_sized(
         let tmp = path.with_extension("bin.tmp");
         std::fs::write(
             &tmp,
-            make_edid_sized(width, height, refresh, width_mm, height_mm),
+            make_edid_sized(width, height, refresh, width_mm, height_mm, s_id),
         )
         .context("write EDID")?;
         std::fs::rename(&tmp, &path).context("place EDID")?;
         tracing::info!(
-            "Generated EDID for {}x{}@{} ({}x{}mm) at {:?}",
+            "Generated EDID for {}x{}@{} ({}x{}mm, serial {}) at {:?}",
             width,
             height,
             refresh,
             width_mm,
             height_mm,
+            s_id,
             path
         );
     }
@@ -185,7 +191,7 @@ pub fn ensure_edid_sized(
 /// Write (or reuse) a generated EDID at the default physical size.
 #[allow(dead_code)]
 pub fn ensure_edid(width: u32, height: u32, refresh: u32) -> Result<PathBuf> {
-    ensure_edid_sized(width, height, refresh, DEFAULT_WIDTH_MM, DEFAULT_HEIGHT_MM)
+    ensure_edid_sized(width, height, refresh, DEFAULT_WIDTH_MM, DEFAULT_HEIGHT_MM, 1)
 }
 
 #[cfg(test)]

@@ -20,8 +20,8 @@ android {
         applicationId = "com.uscreen"
         minSdk = 27
         targetSdk = 34
-        versionCode = 21
-        versionName = "1.2.12"
+        versionCode = 22
+        versionName = "1.3.0"
     }
 
     if (keystoreProps.isNotEmpty()) {
@@ -51,6 +51,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     composeOptions {

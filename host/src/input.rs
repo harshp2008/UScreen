@@ -148,6 +148,9 @@ pub enum InputEvent {
         pressure: f64,
         action: u8,
         slot: u8,
+        #[serde(default)]
+        #[allow(dead_code)]
+        display_id: Option<i32>,
     },
     #[serde(rename = "pen")]
     Pen {
@@ -156,6 +159,9 @@ pub enum InputEvent {
         pressure: f64,
         tilt_x: f64,
         tilt_y: f64,
+        #[serde(default)]
+        #[allow(dead_code)]
+        display_id: Option<i32>,
         /// True when the pen's eraser end is in use (TOOL_TYPE_ERASER).
         /// Emitted as BTN_TOOL_RUBBER so GIMP's eraser works.
         #[serde(default)]
@@ -1507,6 +1513,7 @@ fn handle_event(
             pressure,
             action,
             slot,
+            display_id: _,
         } => {
             let abs_x = (x * COORD_MAX as f64) as i32;
             let abs_y = (y * COORD_MAX as f64) as i32;
@@ -1544,6 +1551,7 @@ fn handle_event(
             tilt_y,
             eraser,
             action,
+            display_id: _,
         } => {
             let abs_x = (x * COORD_MAX as f64) as i32;
             let abs_y = (y * COORD_MAX as f64) as i32;

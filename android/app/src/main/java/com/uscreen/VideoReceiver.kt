@@ -52,6 +52,9 @@ class VideoReceiver {
     private var outputThread: Thread? = null
     @Volatile private var isRunning = false
     @Volatile private var codecAlive = false
+    @Volatile var host: String = HOST
+
+    fun isRunning(): Boolean = isRunning
 
     var onConnected: (() -> Unit)? = null
     var onDisconnected: (() -> Unit)? = null
@@ -496,8 +499,8 @@ class VideoReceiver {
                     continue
                 }
 
-                Log.i(TAG, "Connecting to $HOST:$port...")
-                socket = Socket(HOST, port).apply {
+                Log.i(TAG, "Connecting to $host:$port...")
+                socket = Socket(host, port).apply {
                     tcpNoDelay = true
                     soTimeout = 10000 // 10s read timeout
                     // Small on purpose. A 1 MB receive buffer let the host run

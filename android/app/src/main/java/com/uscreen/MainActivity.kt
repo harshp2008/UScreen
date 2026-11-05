@@ -1,5 +1,7 @@
 package com.uscreen
 
+import android.app.KeyguardManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -8,6 +10,7 @@ import android.net.NetworkCapabilities
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
 import android.view.SurfaceView
@@ -50,6 +53,91 @@ class MainActivity : ComponentActivity() {
     private var videoReceiver: VideoReceiver? = null
     private var touchCapture: TouchCapture? = null
     private lateinit var prefs: Prefs
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var isDeviceLocked by mutableStateOf(false)
+    private var lockReceiver: BroadcastReceiver? = null
+
+    fun applyLockScreenFlags() {
+        val keepAlive = prefs.keepDisplayAliveWhenLocked
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(keepAlive)
+            setTurnScreenOn(keepAlive)
+        }
+        if (keepAlive) {
+            @Suppress("DEPRECATION")
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+            )
+            acquireWakeLock()
+        } else {
+            @Suppress("DEPRECATION")
+            window.clearFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+            )
+            releaseWakeLock()
+        }
+    }
+
+    private fun acquireWakeLock() {
+        if (wakeLock == null) {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UScreen:KeepAliveWakeLock").apply {
+                setReferenceCounted(false)
+            }
+        }
+        try {
+            wakeLock?.let { if (!it.isHeld) it.acquire(10 * 60 * 60 * 1000L) }
+        } catch (e: Exception) {
+            Log.w("UScreen", "Could not acquire WakeLock: ${e.message}")
+        }
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            wakeLock?.let { if (it.isHeld) it.release() }
+        } catch (_: Exception) {}
+    }
+
+    private fun checkKeyguardState() {
+        val km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+        val locked = km.isKeyguardLocked
+        val secure = km.isKeyguardSecure
+        isDeviceLocked = locked
+        if (locked && !secure) {
+            km.requestDismissKeyguard(this, null)
+        }
+    }
+
+    private fun registerLockReceiver() {
+        if (lockReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                when (intent?.action) {
+                    Intent.ACTION_SCREEN_OFF,
+                    Intent.ACTION_SCREEN_ON,
+                    Intent.ACTION_USER_PRESENT -> {
+                        checkKeyguardState()
+                    }
+                }
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        registerReceiver(receiver, filter)
+        lockReceiver = receiver
+    }
+
+    private fun unregisterLockReceiver() {
+        lockReceiver?.let {
+            try { unregisterReceiver(it) } catch (_: Exception) {}
+            lockReceiver = null
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -61,6 +149,10 @@ class MainActivity : ComponentActivity() {
 
         prefs = Prefs(this)
         applyOrientation()
+        applyLockScreenFlags()
+        registerLockReceiver()
+        checkKeyguardState()
+
         videoReceiver = VideoReceiver()
         touchCapture = TouchCapture().also { it.setTouchEnabled(prefs.touchEnabled) }
         applyIntentExtras(intent, restart = false)
@@ -144,6 +236,7 @@ class MainActivity : ComponentActivity() {
                     videoReceiver = videoReceiver,
                     touchCapture = touchCapture,
                     prefs = prefs,
+                    isDeviceLocked = isDeviceLocked,
                     onSurfaceReady = { surfaceView ->
                         videoReceiver?.setSurface(surfaceView)
                         touchCapture?.setSurfaceView(surfaceView)
@@ -343,8 +436,20 @@ class MainActivity : ComponentActivity() {
 
         val newVideoPort = intent.getIntExtra("video_port", -1)
         val newInputPort = intent.getIntExtra("input_port", -1)
+        val newHost = intent.getStringExtra("host")
 
         var portChanged = false
+        var hostChanged = false
+
+        if (newHost != null && newHost.isNotBlank()) {
+            if (touchCapture?.host != newHost || videoReceiver?.host != newHost) {
+                Log.i("UScreen", "Assigned host IP from intent: $newHost")
+                touchCapture?.host = newHost
+                videoReceiver?.host = newHost
+                hostChanged = true
+            }
+        }
+
         if (newVideoPort > 0 && videoReceiver?.port != newVideoPort) {
             Log.i("UScreen", "Assigned unique video port: $newVideoPort")
             videoReceiver?.port = newVideoPort
@@ -361,8 +466,8 @@ class MainActivity : ComponentActivity() {
         touchCapture?.token = token
         videoReceiver?.token = token
 
-        // Only rebuild live connections if token or ports changed
-        if (restart && (tokenChanged || portChanged) && touchCapture?.isControlConnected() == true) {
+        // Only rebuild live connections if token, ports, or host changed
+        if (restart && (tokenChanged || portChanged || hostChanged) && touchCapture?.isControlConnected() == true) {
             Log.i("UScreen", "Session parameters updated — reconnecting")
             touchCapture?.disconnect()
             touchCapture?.connect()
@@ -404,21 +509,24 @@ class MainActivity : ComponentActivity() {
                 if (found != null) runOnUiThread { updateAvailable = found }
             }.start()
         }
-        // The video receiver is started only once the host says it is actually
-        // sending a display. In pen-only mode there is nothing to receive and
-        // spinning up a decoder would waste power for no picture.
+        // Connect control socket; mode acknowledgement from host starts videoReceiver if needed
         touchCapture?.connect()
     }
 
     override fun onStop() {
         super.onStop()
-        videoReceiver?.stop()
-        touchCapture?.disconnect()
+        if (!prefs.keepConnectedInBackground) {
+            Log.i("UScreen", "App backgrounded and keepConnectedInBackground is false — disconnecting")
+            videoReceiver?.stop()
+            touchCapture?.disconnect()
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         stopTiltListener()
+        unregisterLockReceiver()
+        releaseWakeLock()
         stopService(Intent(this, StreamingService::class.java))
     }
 }
@@ -456,6 +564,7 @@ fun UScreenMain(
     touchCapture: TouchCapture? = null,
     onOrientationChange: (Int) -> Unit = {},
     prefs: Prefs? = null,
+    isDeviceLocked: Boolean = false,
 ) {
     var isConnected by remember { mutableStateOf(false) }
     var fps by remember { mutableStateOf(0f) }
@@ -466,6 +575,8 @@ fun UScreenMain(
     var blankInPenMode by remember { mutableStateOf(prefs?.blankPenOnly ?: true) }
     var orientationChoice by remember { mutableStateOf(prefs?.orientation ?: Prefs.ORIENTATION_AUTO) }
     var immersiveOn by remember { mutableStateOf(prefs?.immersiveModeEnabled ?: false) }
+    var keepConnectedInBackground by remember { mutableStateOf(prefs?.keepConnectedInBackground ?: false) }
+    var keepDisplayAliveWhenLocked by remember { mutableStateOf(prefs?.keepDisplayAliveWhenLocked ?: true) }
 
     val context = LocalContext.current
     val activity = context as? MainActivity
@@ -570,6 +681,25 @@ fun UScreenMain(
             }
         }
 
+        // Device locked warning banner
+        if (isDeviceLocked) {
+            Surface(
+                color = Color(0xD9B71C1C),
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 16.dp)
+            ) {
+                Text(
+                    text = "🔒 Device Locked — Touch Disabled",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.White,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
+                )
+            }
+        }
+
         // Settings handle (top-right).
         // OFF (Default): Always visible, exactly matching the original APK.
         // ON (Opt-in): Hidden during streaming, visible when disconnected.
@@ -591,13 +721,12 @@ fun UScreenMain(
             }
         }
 
-        // "Update available" pill under the settings handle. Small, and gone
-        // the moment there is nothing to say.
-        if (updateAvailable != null && showSettingsHandle) {
+        // "Update available" pill at bottom center so it does not overlap the top settings cog.
+        if (updateAvailable != null && showSettingsHandle && !showThanks) {
             Box(
                 modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(top = 56.dp, end = 10.dp)
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 24.dp)
                     .clip(RoundedCornerShape(14.dp))
                     .background(Color(0xCC20202C))
                     .clickable {
@@ -608,7 +737,7 @@ fun UScreenMain(
                             )
                         )
                     }
-                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                    .padding(horizontal = 16.dp, vertical = 8.dp)
             ) {
                 Text("Update $updateAvailable available", fontSize = 12.sp, color = Color.White)
             }
@@ -699,6 +828,17 @@ fun UScreenMain(
                     immersiveOn = it
                     prefs?.immersiveModeEnabled = it
                     activity?.applyImmersiveMode(it)
+                },
+                keepConnectedInBackground = keepConnectedInBackground,
+                onKeepConnectedInBackgroundChange = {
+                    keepConnectedInBackground = it
+                    prefs?.keepConnectedInBackground = it
+                },
+                keepDisplayAliveWhenLocked = keepDisplayAliveWhenLocked,
+                onKeepDisplayAliveWhenLockedChange = {
+                    keepDisplayAliveWhenLocked = it
+                    prefs?.keepDisplayAliveWhenLocked = it
+                    activity?.applyLockScreenFlags()
                 },
                 onExitApp = {
                     activity?.finish()
@@ -805,6 +945,37 @@ private fun checkWifiConnected(context: Context): Boolean {
     return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
 }
 
+enum class DiagnosticState {
+    NO_TRANSPORT,
+    USB_UNAUTHORIZED,
+    SOCKET_REFUSED,
+    WIFI_HOST_UNREACHABLE,
+    CONNECTING
+}
+
+private fun evaluateDiagnostic(
+    usbPlugged: Boolean,
+    wifiOn: Boolean,
+    dynamicDiagnostic: String?,
+    secondsWaiting: Int
+): Pair<DiagnosticState, String> {
+    val state = when {
+        !usbPlugged && !wifiOn -> DiagnosticState.NO_TRANSPORT
+        dynamicDiagnostic?.contains("refused", ignoreCase = true) == true -> DiagnosticState.SOCKET_REFUSED
+        usbPlugged && secondsWaiting > 6 && dynamicDiagnostic == null -> DiagnosticState.USB_UNAUTHORIZED
+        !usbPlugged && wifiOn && (secondsWaiting > 4 || dynamicDiagnostic?.contains("unreachable", ignoreCase = true) == true) -> DiagnosticState.WIFI_HOST_UNREACHABLE
+        else -> DiagnosticState.CONNECTING
+    }
+    val message = when (state) {
+        DiagnosticState.NO_TRANSPORT -> "Please connect a USB cable or ensure Wi-Fi is enabled."
+        DiagnosticState.USB_UNAUTHORIZED -> "RSA Fingerprint not accepted. Check your tablet screen."
+        DiagnosticState.SOCKET_REFUSED -> "Connection refused. Is UScreen running on your PC?"
+        DiagnosticState.WIFI_HOST_UNREACHABLE -> "Wi-Fi connected, but host unreachable. Are you on the same network?"
+        DiagnosticState.CONNECTING -> "Connecting to host..."
+    }
+    return Pair(state, message)
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun OnboardingScreen(videoReceiver: VideoReceiver?) {
@@ -831,21 +1002,6 @@ private fun OnboardingScreen(videoReceiver: VideoReceiver?) {
             usbPlugged = checkUsbConnected(context)
             wifiOn = checkWifiConnected(context)
             secondsWaiting += 1
-
-            // Dynamic Diagnostics evaluation (Task 3)
-            if (step == OnboardingStep.WAITING_FOR_HOST) {
-                if (usbPlugged) {
-                    if (secondsWaiting > 4 && dynamicDiagnostic == null) {
-                        dynamicDiagnostic = "USB connected, but no data received. Is the cable loose? Try a different port."
-                    }
-                } else if (wifiOn) {
-                    if (secondsWaiting > 4 && dynamicDiagnostic == null) {
-                        dynamicDiagnostic = "Wi-Fi connected, but host unreachable. Are you on the same network?"
-                    }
-                } else {
-                    dynamicDiagnostic = "Connect USB cable or connect to Wi-Fi to reach host."
-                }
-            }
             delay(1000)
         }
     }
@@ -963,71 +1119,53 @@ private fun OnboardingScreen(videoReceiver: VideoReceiver?) {
                     }
                 }
                 OnboardingStep.WAITING_FOR_HOST -> {
+                    val (diagState, diagMessage) = evaluateDiagnostic(
+                        usbPlugged = usbPlugged,
+                        wifiOn = wifiOn,
+                        dynamicDiagnostic = dynamicDiagnostic,
+                        secondsWaiting = secondsWaiting
+                    )
+
                     CircularProgressIndicator(
                         color = Accent,
-                        strokeWidth = 3.dp,
-                        modifier = Modifier.size(40.dp)
+                        strokeWidth = 4.dp,
+                        modifier = Modifier.size(48.dp)
+                    )
+                    Spacer(modifier = Modifier.height(24.dp))
+                    Text(
+                        text = diagMessage,
+                        fontSize = 14.sp,
+                        lineHeight = 20.sp,
+                        color = if (diagState == DiagnosticState.CONNECTING) Color(0xFFB0B0C0) else Warn,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 32.dp)
                     )
                     Spacer(modifier = Modifier.height(28.dp))
-                    Card(
-                        shape = RoundedCornerShape(16.dp),
-                        colors = CardDefaults.cardColors(containerColor = Color(0x8C1A1A2A)),
-                        modifier = Modifier.fillMaxWidth(0.85f)
+                    OutlinedButton(
+                        onClick = { showHelpWizard = true },
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentSoft)
                     ) {
-                        Column(
-                            modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Text(
-                                text = "Waiting for Host…",
-                                fontSize = 17.sp,
-                                color = Color.White,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-
-                            // Dynamic Diagnostic Message (Task 3)
-                            val diagText = dynamicDiagnostic ?: if (usbPlugged) {
-                                "USB connected, awaiting video stream from PC…"
-                            } else if (wifiOn) {
-                                "Wi-Fi connected, awaiting host connection…"
-                            } else {
-                                "Plug in the USB cable to begin."
-                            }
-
-                            Text(
-                                text = diagText,
-                                fontSize = 13.sp,
-                                lineHeight = 20.sp,
-                                color = if (dynamicDiagnostic != null) Warn else Color(0xFF9A9AAE),
-                                textAlign = TextAlign.Center
-                            )
-
-                            if (secondsWaiting > 6) {
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Text(
-                                    text = "RSA Fingerprint not accepted? Check your tablet screen for authorization popup.",
-                                    fontSize = 11.sp,
-                                    color = Color(0xFFFFA726),
-                                    textAlign = TextAlign.Center
-                                )
-                            }
-
-                            Spacer(modifier = Modifier.height(18.dp))
-                            OutlinedButton(
-                                onClick = { showHelpWizard = true },
-                                colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentSoft)
-                            ) {
-                                Text("Help Me Fix It 🛠", fontSize = 13.sp)
-                            }
-                        }
+                        Text("Help Me Fix It 🛠", fontSize = 13.sp)
                     }
                 }
             }
         }
 
-        // Interactive "Help Me Fix It" Wizard (Task 4)
+        // Interactive "Help Me Fix It" Wizard
         if (showHelpWizard) {
+            val devOn = step != OnboardingStep.DEVELOPER_OPTIONS_DISABLED
+            val adbOn = step == OnboardingStep.WAITING_FOR_HOST
+            val transportOk = usbPlugged || wifiOn
+
+            // Auto-dismiss and reconnect when all prerequisites become true (8s hold for modal inspection)
+            LaunchedEffect(transportOk, devOn, adbOn) {
+                if (transportOk && devOn && adbOn) {
+                    delay(8000)
+                    videoReceiver?.restartSocket()
+                    showHelpWizard = false
+                }
+            }
+
             ModalBottomSheet(
                 onDismissRequest = { showHelpWizard = false },
                 containerColor = Color(0xFF16161F)
@@ -1051,16 +1189,20 @@ private fun OnboardingScreen(videoReceiver: VideoReceiver?) {
                     )
                     Spacer(Modifier.height(16.dp))
 
-                    // Checklist Step 1: Cable
+                    // Combined Network Transport check (USB OR Wi-Fi)
                     TroubleshootCheckItem(
-                        title = "1. Physical Connection",
-                        detail = if (usbPlugged) "USB cable is securely detected." else "No USB connection detected. Plug in the USB cable.",
-                        passed = usbPlugged
+                        title = "1. Network Transport",
+                        detail = when {
+                            usbPlugged && wifiOn -> "USB and Wi-Fi connected."
+                            usbPlugged -> "USB cable is securely detected."
+                            wifiOn -> "Connected to Wi-Fi network."
+                            else -> "No USB or Wi-Fi connection detected. Connect cable or Wi-Fi."
+                        },
+                        passed = transportOk
                     )
                     Spacer(Modifier.height(12.dp))
 
                     // Checklist Step 2: Developer Options
-                    val devOn = step != OnboardingStep.DEVELOPER_OPTIONS_DISABLED
                     TroubleshootCheckItem(
                         title = "2. Developer Options",
                         detail = if (devOn) "Developer options enabled." else "Disabled. Must tap Build number 7 times.",
@@ -1069,34 +1211,20 @@ private fun OnboardingScreen(videoReceiver: VideoReceiver?) {
                     Spacer(Modifier.height(12.dp))
 
                     // Checklist Step 3: USB Debugging
-                    val adbOn = step == OnboardingStep.WAITING_FOR_HOST
                     TroubleshootCheckItem(
                         title = "3. USB Debugging",
                         detail = if (adbOn) "USB debugging is enabled." else "Disabled. Must toggle in Developer Options.",
                         passed = adbOn
                     )
-                    Spacer(Modifier.height(12.dp))
 
-                    // Checklist Step 4: Wi-Fi Fallback
-                    TroubleshootCheckItem(
-                        title = "4. Wi-Fi Network",
-                        detail = if (wifiOn) "Connected to local Wi-Fi." else "Not connected to Wi-Fi.",
-                        passed = wifiOn
-                    )
-
-                    Spacer(Modifier.height(24.dp))
-                    Button(
-                        onClick = {
-                            videoReceiver?.restartSocket()
-                            secondsWaiting = 0
-                            dynamicDiagnostic = "Restarting socket connection…"
-                            showHelpWizard = false
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = Accent),
+                    Spacer(Modifier.height(20.dp))
+                    Text(
+                        text = "Once all items above show a green checkmark, UScreen will connect automatically.",
+                        fontSize = 12.sp,
+                        color = Color(0xFF9A9AB0),
+                        textAlign = TextAlign.Center,
                         modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("Restart Connection", color = Color.White, fontWeight = FontWeight.Bold)
-                    }
+                    )
                     Spacer(Modifier.height(16.dp))
                 }
             }
@@ -1147,6 +1275,10 @@ private fun SettingsSheet(
     onApply: (bitrateKbps: Int, fps: Int) -> Unit,
     immersiveModeEnabled: Boolean = false,
     onImmersiveModeEnabledChange: (Boolean) -> Unit = {},
+    keepConnectedInBackground: Boolean = false,
+    onKeepConnectedInBackgroundChange: (Boolean) -> Unit = {},
+    keepDisplayAliveWhenLocked: Boolean = true,
+    onKeepDisplayAliveWhenLockedChange: (Boolean) -> Unit = {},
     onExitApp: () -> Unit = {},
     onDismiss: () -> Unit,
 ) {
@@ -1401,6 +1533,50 @@ private fun SettingsSheet(
                 Switch(
                     checked = immersiveModeEnabled,
                     onCheckedChange = onImmersiveModeEnabledChange,
+                    colors = SwitchDefaults.colors(checkedTrackColor = Accent)
+                )
+            }
+            Spacer(Modifier.height(20.dp))
+
+            // Keep connected in background
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Keep connected in background", fontSize = 14.sp, color = Color(0xFFB0B0C0))
+                    Text(
+                        "Maintain stream and touch connection when switched away. Consumes more battery.",
+                        fontSize = 11.sp,
+                        color = Color(0xFF6A6A7E)
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Switch(
+                    checked = keepConnectedInBackground,
+                    onCheckedChange = onKeepConnectedInBackgroundChange,
+                    colors = SwitchDefaults.colors(checkedTrackColor = Accent)
+                )
+            }
+            Spacer(Modifier.height(20.dp))
+
+            // Keep display alive when locked
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Keep display alive when locked", fontSize = 14.sp, color = Color(0xFFB0B0C0))
+                    Text(
+                        "Hold system WakeLock while locked. Note: secure keyguard disables touch input until unlocked.",
+                        fontSize = 11.sp,
+                        color = Color(0xFF6A6A7E)
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Switch(
+                    checked = keepDisplayAliveWhenLocked,
+                    onCheckedChange = onKeepDisplayAliveWhenLockedChange,
                     colors = SwitchDefaults.colors(checkedTrackColor = Accent)
                 )
             }

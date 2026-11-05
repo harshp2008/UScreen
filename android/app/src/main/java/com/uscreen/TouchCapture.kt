@@ -26,6 +26,16 @@ class TouchCapture {
     /// WebSocket port on 127.0.0.1. Defaults to 8891.
     @Volatile var port: Int = DEFAULT_PORT
 
+    /// Host IP address for WebSocket connection. Defaults to 127.0.0.1 (ADB reverse forward).
+    @Volatile var host: String = "127.0.0.1"
+
+    /// Target display ID (defaults to 0 or virtual display ID).
+    @Volatile var targetDisplayId: Int = 0
+
+    /// Virtual display resolution used for coordinate mapping.
+    @Volatile var virtualWidth: Int = 0
+    @Volatile var virtualHeight: Int = 0
+
     private var webSocket: WebSocket? = null
     @Volatile private var isConnected = false
     private var reconnectJob: Job? = null
@@ -64,6 +74,13 @@ class TouchCapture {
         nativeHeight = height
         nativeWidthMm = widthMm
         nativeHeightMm = heightMm
+        if (virtualWidth == 0) virtualWidth = width
+        if (virtualHeight == 0) virtualHeight = height
+    }
+
+    fun setVirtualResolution(width: Int, height: Int) {
+        virtualWidth = width
+        virtualHeight = height
     }
 
     private val client = OkHttpClient.Builder()
@@ -89,6 +106,7 @@ class TouchCapture {
             if (nativeWidth > 0 && nativeHeight > 0) {
                 val res = JSONObject().apply {
                     put("type", "resolution")
+                    put("version", BuildConfig.VERSION_NAME)
                     put("width", nativeWidth)
                     put("height", nativeHeight)
                     if (nativeWidthMm > 0 && nativeHeightMm > 0) {
@@ -98,7 +116,7 @@ class TouchCapture {
                 }
                 webSocket.send(res.toString())
                 Log.i(TAG, "Reported native resolution: ${nativeWidth}x${nativeHeight} " +
-                        "(${nativeWidthMm}x${nativeHeightMm} mm)")
+                        "(${nativeWidthMm}x${nativeHeightMm} mm), version: ${BuildConfig.VERSION_NAME}")
             }
             pendingConfig?.let { webSocket.send(it.toString()) }
             pendingMode?.let {
@@ -149,6 +167,9 @@ class TouchCapture {
     @android.annotation.SuppressLint("ClickableViewAccessibility")
     fun setSurfaceView(sv: SurfaceView) {
         surfaceView = sv
+        try {
+            targetDisplayId = sv.display?.displayId ?: 0
+        } catch (_: Exception) {}
 
         sv.setOnTouchListener { view, event ->
             handleMotionEvent(event, view.width, view.height)
@@ -195,7 +216,7 @@ class TouchCapture {
     private fun connectWebSocket() {
         webSocket?.cancel()
         val request = Request.Builder()
-            .url("ws://127.0.0.1:$port")
+            .url("ws://$host:$port")
             .build()
         webSocket = client.newWebSocket(request, wsListener)
     }
@@ -241,6 +262,47 @@ class TouchCapture {
         }
     }
 
+    private data class CoordinateQuad(val w: Float, val h: Float, val ox: Float, val oy: Float)
+
+    /**
+     * Maps physical view touch coordinates to the virtual display's normalized [0.0, 1.0] range.
+     * Accounts for pillarbox/letterbox padding when panel aspect ratio diverges from virtual display.
+     */
+    fun mapCoordinates(rawX: Float, rawY: Float, vw: Float, vh: Float): Pair<Float, Float> {
+        if (virtualWidth <= 0 || virtualHeight <= 0) {
+            return (rawX / vw).coerceIn(0f, 1f) to (rawY / vh).coerceIn(0f, 1f)
+        }
+        val viewAspect = vw / vh
+        val virtAspect = virtualWidth.toFloat() / virtualHeight.toFloat()
+        val quad = if (viewAspect > virtAspect) {
+            val h = vh
+            val w = vh * virtAspect
+            val ox = (vw - w) / 2f
+            CoordinateQuad(w, h, ox, 0f)
+        } else {
+            val w = vw
+            val h = vw / virtAspect
+            val oy = (vh - h) / 2f
+            CoordinateQuad(w, h, 0f, oy)
+        }
+        val nx = ((rawX - quad.ox) / quad.w).coerceIn(0f, 1f)
+        val ny = ((rawY - quad.oy) / quad.h).coerceIn(0f, 1f)
+        return nx to ny
+    }
+
+    /**
+     * Constructs a MotionEvent targeted at a specific virtual display ID.
+     * Implements display targeting corresponding to scrcpy PR #5614.
+     */
+    fun obtainMotionEventWithDisplay(event: MotionEvent, displayId: Int): MotionEvent {
+        val copy = MotionEvent.obtain(event)
+        try {
+            val method = MotionEvent::class.java.getMethod("setDisplayId", Int::class.javaPrimitiveType)
+            method.invoke(copy, displayId)
+        } catch (_: Exception) {}
+        return copy
+    }
+
     fun handleMotionEvent(event: MotionEvent, width: Int, height: Int): Boolean {
         if (!isConnected) return false
 
@@ -267,10 +329,8 @@ class TouchCapture {
                     if (penIsActive() || !touchEnabled) return true
                     val slot = slotOf(event, actionIndex)
                     downSlots.add(slot)
-                    sendTouch(event.getX(actionIndex) / vw,
-                        event.getY(actionIndex) / vh,
-                        event.getPressure(actionIndex).toDouble(),
-                        0, slot)
+                    val (nx, ny) = mapCoordinates(event.getX(actionIndex), event.getY(actionIndex), vw, vh)
+                    sendTouch(nx, ny, event.getPressure(actionIndex).toDouble(), 0, slot)
                 }
             }
 
@@ -282,7 +342,8 @@ class TouchCapture {
                         // it now or the Linux side keeps that slot pressed.
                         val slot = slotOf(event, i)
                         if (downSlots.remove(slot)) {
-                            sendTouch(event.getX(i) / vw, event.getY(i) / vh, 0.0, 1, slot)
+                            val (nx, ny) = mapCoordinates(event.getX(i), event.getY(i), vw, vh)
+                            sendTouch(nx, ny, 0.0, 1, slot)
                         }
                         continue
                     }
@@ -293,8 +354,7 @@ class TouchCapture {
                         // pen strokes look jagged in GIMP.
                         val hist = event.historySize
                         for (h in 0 until hist) {
-                            val hx = event.getHistoricalX(i, h) / vw
-                            val hy = event.getHistoricalY(i, h) / vh
+                            val (hx, hy) = mapCoordinates(event.getHistoricalX(i, h), event.getHistoricalY(i, h), vw, vh)
                             val hp = event.getHistoricalPressure(i, h).toDouble()
                             val (htx, hty) = decomposeTilt(
                                 getHistoricalAxis(event, MotionEvent.AXIS_TILT, i, h),
@@ -305,10 +365,8 @@ class TouchCapture {
                         sendPenEvent(event, i, 2, vw, vh)
                     } else {
                         if (penIsActive() || !touchEnabled) continue
-                        sendTouch(event.getX(i) / vw,
-                            event.getY(i) / vh,
-                            event.getPressure(i).toDouble(),
-                            2, slotOf(event, i))
+                        val (nx, ny) = mapCoordinates(event.getX(i), event.getY(i), vw, vh)
+                        sendTouch(nx, ny, event.getPressure(i).toDouble(), 2, slotOf(event, i))
                     }
                 }
             }
@@ -332,9 +390,8 @@ class TouchCapture {
                     // now, if we sent its DOWN we owe the host its UP.
                     val slot = slotOf(event, actionIndex)
                     if (downSlots.remove(slot)) {
-                        sendTouch(event.getX(actionIndex) / vw,
-                            event.getY(actionIndex) / vh,
-                            0.0, 1, slot)
+                        val (nx, ny) = mapCoordinates(event.getX(actionIndex), event.getY(actionIndex), vw, vh)
+                        sendTouch(nx, ny, 0.0, 1, slot)
                     }
                 }
             }
@@ -342,9 +399,8 @@ class TouchCapture {
             MotionEvent.ACTION_CANCEL -> {
                 for (i in 0 until pointerCount) {
                     if (isPalm(event, i)) continue
-                    sendTouch(event.getX(i) / vw,
-                        event.getY(i) / vh,
-                        0.0, 1, slotOf(event, i))
+                    val (nx, ny) = mapCoordinates(event.getX(i), event.getY(i), vw, vh)
+                    sendTouch(nx, ny, 0.0, 1, slotOf(event, i))
                 }
             }
         }
@@ -440,8 +496,7 @@ class TouchCapture {
 
     private fun sendPenEvent(event: MotionEvent, index: Int, action: Int,
                               vw: Float, vh: Float) {
-        val x = event.getX(index) / vw
-        val y = event.getY(index) / vh
+        val (x, y) = mapCoordinates(event.getX(index), event.getY(index), vw, vh)
         val pressure = event.getPressure(index).toDouble()
         val (tiltX, tiltY) = decomposeTilt(
             getAxis(event, MotionEvent.AXIS_TILT, index),
@@ -485,6 +540,7 @@ class TouchCapture {
             put("tilt_y", tiltY)
             put("eraser", eraser)
             put("action", action)
+            put("display_id", targetDisplayId)
         }
         webSocket?.send(msg.toString())
     }
@@ -533,6 +589,7 @@ class TouchCapture {
             put("pressure", pressure.coerceIn(0.0, 1.0))
             put("action", action)
             put("slot", slot)
+            put("display_id", targetDisplayId)
         }
         webSocket?.send(msg.toString())
     }

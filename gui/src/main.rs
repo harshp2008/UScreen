@@ -38,6 +38,8 @@ struct TabletProfile {
     pub keep_alive: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub locked_apps: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
     #[serde(flatten)]
     pub extra: toml::value::Table,
 }
@@ -92,11 +94,18 @@ struct FileConfig {
     keep_alive: bool,
     #[serde(default)]
     locked_apps: Vec<String>,
+    #[serde(default = "default_version")]
+    version: String,
+}
+
+fn default_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 impl Default for FileConfig {
     fn default() -> Self {
         Self {
+            version: default_version(),
             encoder: "h264_nvenc".into(),
             fps: 60,
             bitrate: 20000,
@@ -199,10 +208,13 @@ impl Default for DeviceAdbState {
 #[derive(Default, Clone, PartialEq, Eq)]
 struct ConnectedDevice {
     serial: String,
+    hw_id: String,
     model: String,
     transport: String,
     adb_state: DeviceAdbState,
     state_detail: String,
+    app_version: Option<String>,
+    version_mismatch: bool,
 }
 
 #[derive(Default, Clone)]
@@ -254,6 +266,27 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn install_apk(serial: &str) -> Result<String, String> {
+    let h = home();
+    let candidates = [
+        PathBuf::from("android/app/build/outputs/apk/debug/app-debug.apk"),
+        PathBuf::from(format!("{}/Documents/GITHUB PROJECTS/UScreen/android/app/build/outputs/apk/debug/app-debug.apk", h)),
+        PathBuf::from("/usr/share/uscreen/app-debug.apk"),
+        PathBuf::from(format!("{}/.local/share/uscreen/app-debug.apk", h)),
+    ];
+    let apk = candidates.iter().find(|p| p.exists())
+        .ok_or_else(|| "app-debug.apk not found. Please build it first with `./gradlew assembleDebug`.".to_string())?;
+    let out = Command::new("adb")
+        .args(["-s", serial, "install", "-r", &apk.to_string_lossy()])
+        .output()
+        .map_err(|e| format!("Failed to run adb install: {}", e))?;
+    if out.status.success() {
+        Ok(format!("Installed APK on {}", serial))
+    } else {
+        Err(format!("Install failed: {}", String::from_utf8_lossy(&out.stderr).trim()))
+    }
+}
+
 #[allow(clippy::field_reassign_with_default)]
 fn poll_status() -> Status {
     let mut s = Status::default();
@@ -277,6 +310,7 @@ fn poll_status() -> Status {
 
     if let Ok(out) = Command::new("adb").args(["devices", "-l"]).output() {
         let text = String::from_utf8_lossy(&out.stdout);
+        let mut raw_devices = Vec::new();
         for line in text.lines().skip(1) {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.is_empty() {
@@ -315,14 +349,64 @@ fn poll_status() -> Status {
                     format!("ADB status: {}. Check device cable and permissions.", other),
                 ),
             };
-            s.connected_devices.push(ConnectedDevice {
+
+            let hw_id = if transport == "USB" {
+                serial.clone()
+            } else {
+                Command::new("adb")
+                    .args(["-s", &serial, "shell", "getprop", "ro.serialno"])
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .filter(|s| !s.is_empty() && s != "unknown")
+                    .unwrap_or_else(|| serial.clone())
+            };
+
+            let (app_version, version_mismatch) = if adb_state == DeviceAdbState::Device {
+                let ver = Command::new("adb")
+                    .args(["-s", &serial, "shell", "dumpsys package com.uscreen | grep versionName"])
+                    .output()
+                    .ok()
+                    .and_then(|o| {
+                        let out = String::from_utf8_lossy(&o.stdout);
+                        out.lines().find_map(|l| {
+                            l.split("versionName=").nth(1).map(|v| v.trim().to_string())
+                        })
+                    });
+                let mismatch = ver.as_deref().map(|v| v != env!("CARGO_PKG_VERSION")).unwrap_or(false);
+                (ver, mismatch)
+            } else {
+                (None, false)
+            };
+
+            raw_devices.push(ConnectedDevice {
                 serial,
+                hw_id,
                 model,
                 transport,
                 adb_state,
                 state_detail,
+                app_version,
+                version_mismatch,
             });
         }
+
+        // Deduplicate devices by physical hardware ID, preferring USB over Wi-Fi
+        let mut deduped: std::collections::HashMap<String, ConnectedDevice> = std::collections::HashMap::new();
+        for dev in raw_devices {
+            deduped
+                .entry(dev.hw_id.clone())
+                .and_modify(|existing| {
+                    if existing.transport != "USB" && dev.transport == "USB" {
+                        *existing = dev.clone();
+                    }
+                })
+                .or_insert(dev);
+        }
+        let mut sorted_devices: Vec<ConnectedDevice> = deduped.into_values().collect();
+        sorted_devices.sort_by(|a, b| a.serial.cmp(&b.serial));
+        s.connected_devices = sorted_devices;
+
         if let Some(first) = s.connected_devices.iter().find(|d| d.adb_state == DeviceAdbState::Device) {
             s.device_connected = true;
             s.device_model = first.model.clone();
@@ -334,10 +418,13 @@ fn poll_status() -> Status {
                 let model = format!("Emulated Device ({})", fake);
                 s.connected_devices.push(ConnectedDevice {
                     serial: fake.to_string(),
+                    hw_id: fake.to_string(),
                     model: model.clone(),
                     transport: "Emulated".to_string(),
                     adb_state: DeviceAdbState::Device,
                     state_detail: "Emulated virtual test tablet".to_string(),
+                    app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                    version_mismatch: false,
                 });
                 s.device_connected = true;
                 if s.device_model.is_empty() {
@@ -842,6 +929,54 @@ impl App {
                         }
                     }
                 });
+
+                if let Some(ref ver) = conn.and_then(|c| c.app_version.as_ref()) {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Installed App:").weak().size(11.0));
+                        ui.label(egui::RichText::new(format!("v{}", ver)).size(11.0));
+                        if conn.map(|c| c.version_mismatch).unwrap_or(false) {
+                            ui.label(
+                                egui::RichText::new(format!("(Host is v{})", env!("CARGO_PKG_VERSION")))
+                                    .color(egui::Color32::from_rgb(255, 180, 80))
+                                    .size(11.0),
+                            );
+                        }
+                    });
+                }
+
+                if conn.map(|c| c.version_mismatch).unwrap_or(false) {
+                    ui.add_space(8.0);
+                    egui::Frame::group(ui.style())
+                        .fill(egui::Color32::from_rgb(50, 38, 22))
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("⚠ Device firmware version mismatch. Please update the app.")
+                                        .color(egui::Color32::from_rgb(255, 180, 80))
+                                        .size(11.0)
+                                        .strong(),
+                                );
+                                if ui.button("Push New APK to Device").clicked() {
+                                    match install_apk(serial) {
+                                        Ok(msg) => self.message = msg,
+                                        Err(err) => self.message = err,
+                                    }
+                                }
+                            });
+                        });
+                }
+
+                if is_connected {
+                    ui.add_space(8.0);
+                    if ui.button("📲  Install / Reinstall App on Device").clicked() {
+                        match install_apk(serial) {
+                            Ok(msg) => self.message = msg,
+                            Err(err) => self.message = err,
+                        }
+                    }
+                }
             });
 
         ui.add_space(12.0);
@@ -1318,7 +1453,24 @@ impl eframe::App for App {
                         }
                     }
 
-                    ui.add_space(20.0);
+                    ui.add_space(8.0);
+                    let target_serial = match &self.selected_view {
+                        SelectedView::Device(s) => Some(s.clone()),
+                        _ => status.connected_devices.iter().find(|d| d.adb_state == DeviceAdbState::Device).map(|d| d.serial.clone()),
+                    };
+                    if let Some(ref s) = target_serial {
+                        if ui.add_sized(
+                            egui::vec2(ui.available_width(), 26.0),
+                            egui::Button::new("📲  Install Android App"),
+                        ).on_hover_text(format!("Push latest app-debug.apk to {}", s)).clicked() {
+                            match install_apk(s) {
+                                Ok(msg) => self.message = msg,
+                                Err(err) => self.message = err,
+                            }
+                        }
+                    }
+
+                    ui.add_space(14.0);
                     ui.separator();
                     ui.add_space(6.0);
 

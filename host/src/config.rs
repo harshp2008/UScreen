@@ -68,6 +68,9 @@ pub struct TabletProfile {
     /// Application window locking: allowed apps on this monitor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub locked_apps: Option<Vec<String>>,
+    /// Firmware/APK version reported by the connected Android client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -187,11 +190,19 @@ pub struct FileConfig {
     /// Application window locking: allowed apps on the virtual monitor.
     #[serde(default)]
     pub locked_apps: Vec<String>,
+    /// Protocol/daemon version.
+    #[serde(default = "default_version")]
+    pub version: String,
+}
+
+fn default_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 impl Default for FileConfig {
     fn default() -> Self {
         Self {
+            version: default_version(),
             encoder: "h264_nvenc".into(),
             fps: 60,
             bitrate: 20000,

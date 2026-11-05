@@ -95,4 +95,20 @@ class Prefs(context: Context) {
     var thankedOnce: Boolean
         get() = sp.getBoolean("thanked_once", false)
         set(v) = sp.edit().putBoolean("thanked_once", v).apply()
+
+    /**
+     * Whether the socket and streaming pipeline stay connected when the app
+     * is backgrounded. Default is false (OFF) to prevent battery drain.
+     */
+    var keepConnectedInBackground: Boolean
+        get() = sp.getBoolean("keep_connected_in_background", false)
+        set(v) = sp.edit().putBoolean("keep_connected_in_background", v).apply()
+
+    /**
+     * Keep virtual display active and awake when the physical device is locked.
+     * Default is true (ON).
+     */
+    var keepDisplayAliveWhenLocked: Boolean
+        get() = sp.getBoolean("keep_display_alive_when_locked", true)
+        set(v) = sp.edit().putBoolean("keep_display_alive_when_locked", v).apply()
 }

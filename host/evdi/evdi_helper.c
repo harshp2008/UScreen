@@ -1270,7 +1270,7 @@ static int find_evdi_device(void) {
             if (strncmp(drm_entry->d_name, "card", 4) != 0)
                 continue;
             int card = atoi(drm_entry->d_name + 4);
-            if (card > 0) {
+            if (card >= 0) {
                 found = card;
             }
         }

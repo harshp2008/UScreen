@@ -673,12 +673,13 @@ async fn run_daemon(cli: Cli) -> Result<()> {
 fn other_daemons() -> Vec<u32> {
     use std::os::unix::fs::MetadataExt;
     let me = std::process::id();
+    let ppid = unsafe { libc::getppid() as u32 };
     let uid = unsafe { libc::getuid() };
     let mut out = Vec::new();
     let Ok(dir) = std::fs::read_dir("/proc") else { return out };
     for e in dir.flatten() {
         let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else { continue };
-        if pid == me { continue; }
+        if pid == me || pid == ppid { continue; }
         let base = e.path();
         let Ok(comm) = std::fs::read_to_string(base.join("comm")) else { continue };
         if comm.trim() != "uscreen" { continue; }
@@ -687,7 +688,7 @@ fn other_daemons() -> Vec<u32> {
         // subcommand means start. Only the other subcommands are not daemons.
         let args: Vec<&[u8]> = cmd.split(|b| *b == 0).skip(1).collect();
         let other_subcommand = args.iter().any(|a| {
-            matches!(*a, b"stop" | b"status" | b"list-displays" | b"doctor" | b"wifi" | b"--help" | b"-h" | b"--version" | b"-V")
+            matches!(*a, b"stop" | b"status" | b"list-displays" | b"doctor" | b"wifi" | b"--help" | b"-h" | b"--version" | b"-V" | b"-d" | b"--daemonize")
         });
         if other_subcommand { continue; }
         // Same user only: another account's daemon is not ours to touch.
@@ -814,6 +815,10 @@ struct ExtraSessionTemplate {
 /// One extra tablet's running pipeline.
 struct ExtraSession {
     instance: u32,
+    #[allow(dead_code)]
+    hw_id: String,
+    active_serial: String,
+    transport: Transport,
     /// This tablet's own settings, so its remembered panel can be applied to
     /// it and whatever it reports can be written back under its serial.
     settings_tx: watch::Sender<capture::EncoderSettings>,
@@ -823,25 +828,35 @@ struct ExtraSession {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     video_port: u16,
     input_port: u16,
+    last_relaunch: std::time::Instant,
+    relaunch_wait: std::time::Duration,
+    relaunches: u32,
 }
 
 impl ExtraSession {
-    async fn stop(self) {
-        let _ = self.tablet_tx.send(false);
-        let _ = self.stop_tx.send(true);
-        // Let the capture manager disable its output and reap its children
-        // before the tasks are dropped.
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-        for t in self.tasks {
-            t.abort();
-        }
+    fn stop_background(self) {
+        tokio::spawn(async move {
+            let _ = self.tablet_tx.send(false);
+            let _ = self.stop_tx.send(true);
+            // Let the capture manager disable its output and reap its children
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            for t in self.tasks {
+                t.abort();
+            }
+        });
     }
 }
 
 /// Bring up capture, stream and input for tablet number `instance`.
 /// Ports are the base ports plus 2 per instance; the tablet side keeps
 /// using 8890/8891, since `adb reverse` maps them per device.
-fn spawn_extra_session(t: &ExtraSessionTemplate, instance: u32, serial: &str) -> Option<ExtraSession> {
+fn spawn_extra_session(
+    t: &ExtraSessionTemplate,
+    instance: u32,
+    serial: &str,
+    hw_id: String,
+    transport: Transport,
+) -> Option<ExtraSession> {
     let cards = vdisplay::evdi_cards();
     let mut cfg = t.cap_template.clone();
     cfg.instance = instance;
@@ -1002,6 +1017,9 @@ fn spawn_extra_session(t: &ExtraSessionTemplate, instance: u32, serial: &str) ->
     );
     Some(ExtraSession {
         instance,
+        hw_id,
+        active_serial: serial.to_string(),
+        transport,
         tablet_tx,
         relaunch,
         stop_tx,
@@ -1009,7 +1027,103 @@ fn spawn_extra_session(t: &ExtraSessionTemplate, instance: u32, serial: &str) ->
         video_port,
         input_port,
         settings_tx: settings_tx_keep,
+        last_relaunch: std::time::Instant::now() - std::time::Duration::from_secs(60),
+        relaunch_wait: std::time::Duration::from_secs(5),
+        relaunches: 0,
     })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DiscoveredDevice {
+    serial: String,
+    state: String,
+    transport: Transport,
+    hw_id: String,
+}
+
+async fn resolve_hw_id(
+    serial: &str,
+    cache: &mut std::collections::HashMap<String, String>,
+) -> String {
+    if !is_network_serial(serial) {
+        return serial.to_string();
+    }
+    if let Some(cached) = cache.get(serial) {
+        return cached.clone();
+    }
+    let file_cfg = config::FileConfig::load();
+    for (k, v) in &file_cfg.tablets {
+        if v.wifi_address.as_deref() == Some(serial) {
+            cache.insert(serial.to_string(), k.clone());
+            return k.clone();
+        }
+    }
+    if let Ok(o) = tokio::time::timeout(
+        std::time::Duration::from_millis(800),
+        tokio::process::Command::new("adb")
+            .args(["-s", serial, "shell", "getprop", "ro.serialno"])
+            .output(),
+    )
+    .await
+    {
+        if let Ok(output) = o {
+            let hw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !hw.is_empty() && hw != "unknown" {
+                cache.insert(serial.to_string(), hw.clone());
+                return hw;
+            }
+        }
+    }
+    serial.to_string()
+}
+
+async fn scan_adb_devices(
+    hw_cache: &mut std::collections::HashMap<String, String>,
+) -> Vec<DiscoveredDevice> {
+    let Ok(out) = tokio::process::Command::new("adb")
+        .args(["devices", "-l"])
+        .output()
+        .await
+    else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut out_devices = Vec::new();
+
+    for line in text.lines().skip(1) {
+        let mut parts = line.split_whitespace();
+        let Some(serial) = parts.next() else { continue };
+        let Some(state) = parts.next() else { continue };
+        let transport = transport_of(serial);
+        let hw_id = if transport == Transport::Usb {
+            serial.to_string()
+        } else {
+            resolve_hw_id(serial, hw_cache).await
+        };
+        out_devices.push(DiscoveredDevice {
+            serial: serial.to_string(),
+            state: state.to_string(),
+            transport,
+            hw_id,
+        });
+    }
+
+    // Support USCREEN_FAKE_TABLET test hook
+    if let Ok(fake) = std::env::var("USCREEN_FAKE_TABLET") {
+        for f in fake.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+            if !out_devices.iter().any(|d| d.serial == f) {
+                out_devices.push(DiscoveredDevice {
+                    serial: f.to_string(),
+                    state: "device".to_string(),
+                    transport: transport_of(f),
+                    hw_id: f.to_string(),
+                });
+            }
+        }
+    }
+
+
+    out_devices
 }
 
 /// Keeps watching for tablets. The first serial seen gets the pipeline wired
@@ -1032,140 +1146,177 @@ async fn adb_monitor(
     settings_tx: watch::Sender<capture::EncoderSettings>,
     serial_tx: watch::Sender<Option<String>>,
 ) {
-    let mut slot_0_serial: Option<String> = None;
-    let mut last_relaunch = std::time::Instant::now() - std::time::Duration::from_secs(60);
-    let mut relaunches: u32 = 0;
-    let mut relaunch_wait = std::time::Duration::from_secs(5);
+    let mut slot_0_hw: Option<String> = None;
+    let mut slot_0_active_serial: String = String::new();
+    let mut slot_0_transport: Transport = Transport::Usb;
+    let mut slot_0_last_relaunch = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    let mut slot_0_relaunches: u32 = 0;
+    let mut slot_0_relaunch_wait = std::time::Duration::from_secs(5);
     const RELAUNCH_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(600);
+
     let mut polls_since_check: u32 = 0;
-    const APP_CHECK_EVERY: u32 = 5;
-    let mut wifi_announced = false;
+    const APP_CHECK_EVERY: u32 = 2; // Check watchdog every 4s
     let mut extras: std::collections::HashMap<String, ExtraSession> = std::collections::HashMap::new();
+    let mut hw_cache: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut offline_since: std::collections::HashMap<String, std::time::Instant> = std::collections::HashMap::new();
 
     if tokio::process::Command::new("adb").arg("version").output().await.is_err() {
         error!("adb is not installed — devices cannot be found. Install android-tools (or adb) and restart.");
     }
 
     loop {
-        let mut devices = adb_devices().await;
-        // Test hook: pretend a serial is attached so a second pipeline can be
-        // exercised with one physical tablet and a loopback client.
-        if let Ok(fake) = std::env::var("USCREEN_FAKE_TABLET") {
-            for f in fake.split(',').map(str::trim).filter(|f| !f.is_empty()) {
-                if !devices.iter().any(|d| d == f) {
-                    devices.push(f.to_string());
+        let all_devices = scan_adb_devices(&mut hw_cache).await;
+
+        // ADB State Hygiene: handle offline devices with targeted reconnect without killing adb server
+        for dev in &all_devices {
+            if dev.state == "offline" {
+                let entry = offline_since.entry(dev.serial.clone()).or_insert_with(std::time::Instant::now);
+                if entry.elapsed() >= std::time::Duration::from_secs(4) {
+                    warn!("Device {} is offline ({:?}) — issuing targeted reconnect", dev.serial, entry.elapsed());
+                    if dev.transport == Transport::Network {
+                        let _ = tokio::process::Command::new("adb").args(["disconnect", &dev.serial]).output().await;
+                    } else {
+                        let _ = tokio::process::Command::new("adb").args(["-s", &dev.serial, "reconnect"]).output().await;
+                    }
+                    *entry = std::time::Instant::now();
                 }
+            } else {
+                offline_since.remove(&dev.serial);
             }
         }
 
-        // 1. Check existing sessions: detect disconnected devices with absolute session isolation
-        if let Some(ref s0) = slot_0_serial.clone() {
-            if !devices.contains(s0) {
-                let mut handed_off = false;
-                if transport_of(s0) == Transport::Usb {
-                    // USB unplugged: check if we can seamlessly hand off to Wi-Fi without tearing down the EVDI display!
-                    let file_cfg = config::FileConfig::load();
-                    let target_wifi = file_cfg.tablets.get(s0)
-                        .and_then(|p| p.wifi_address.clone())
-                        .or_else(|| if !file_cfg.wifi_address.is_empty() { Some(file_cfg.wifi_address.clone()) } else { None });
+        // Group ready devices by unique physical hardware ID, preferring USB over Network
+        let ready_devices: Vec<&DiscoveredDevice> = all_devices.iter().filter(|d| d.state == "device").collect();
+        let mut physical_devices: std::collections::HashMap<String, &DiscoveredDevice> = std::collections::HashMap::new();
+        for dev in ready_devices {
+            physical_devices
+                .entry(dev.hw_id.clone())
+                .and_modify(|existing| {
+                    if existing.transport != Transport::Usb && dev.transport == Transport::Usb {
+                        *existing = dev;
+                    }
+                })
+                .or_insert(dev);
+        }
 
-                    if let Some(ref wifi_addr) = target_wifi {
-                        let mut wifi_ready = devices.iter().any(|d| d == wifi_addr);
-                        if !wifi_ready {
-                            if let Ok(o) = tokio::process::Command::new("adb").args(["connect", wifi_addr]).output().await {
-                                let said = String::from_utf8_lossy(&o.stdout);
-                                if said.contains("connected") {
-                                    wifi_ready = true;
-                                }
-                            }
-                        }
-                        if wifi_ready {
-                            info!("Seamless handoff: Slot 1 switched from USB ({}) to Wi-Fi ({}) without display teardown", s0, wifi_addr);
-                            if !is_fake_serial(s0) {
-                                teardown_adb_forwarding(s0, video_port, input_port).await;
-                                on_tablet_connected(wifi_addr, video_port, input_port, auto_launch, token.as_deref()).await;
-                            }
-                            slot_0_serial = Some(wifi_addr.clone());
-                            let _ = serial_tx.send(Some(wifi_addr.clone()));
-                            announce_transport(wifi_addr);
-                            handed_off = true;
+        // 1. Maintain Slot 0 Session with strict device isolation
+        if let Some(ref s0_hw) = slot_0_hw.clone() {
+            if let Some(best_dev) = physical_devices.get(s0_hw) {
+                // Device is active. Check for seamless USB <-> Wi-Fi handoff for this physical device
+                if best_dev.serial != slot_0_active_serial {
+                    info!(
+                        "Seamless handoff: Slot 1 switched transport from {} ({}) to {} ({}) without display teardown",
+                        slot_0_transport.label(), slot_0_active_serial,
+                        best_dev.transport.label(), best_dev.serial
+                    );
+                    if !is_fake_serial(&slot_0_active_serial) {
+                        teardown_adb_forwarding(&slot_0_active_serial, video_port, input_port).await;
+                    }
+                    if !is_fake_serial(&best_dev.serial) {
+                        on_tablet_connected(&best_dev.serial, video_port, input_port, auto_launch, token.as_deref()).await;
+                        if best_dev.transport == Transport::Usb {
+                            auto_provision_wifi(&best_dev.serial).await;
                         }
                     }
+                    slot_0_active_serial = best_dev.serial.clone();
+                    slot_0_transport = best_dev.transport;
+                    let _ = serial_tx.send(Some(best_dev.serial.clone()));
+                    announce_transport(&best_dev.serial);
                 }
+            } else {
+                // Device s0_hw has disconnected
+                info!("Device on Slot 1 disconnected ({})", slot_0_active_serial);
+                if !is_fake_serial(&slot_0_active_serial) {
+                    teardown_adb_forwarding(&slot_0_active_serial, video_port, input_port).await;
+                }
+                let _ = tablet_tx.send(false);
+                let _ = serial_tx.send(None);
+                slot_0_hw = None;
+                slot_0_active_serial.clear();
+            }
+        }
 
-                if !handed_off {
-                    info!("Device on Slot 1 disconnected ({})", s0);
-                    if !is_fake_serial(s0) {
-                        teardown_adb_forwarding(s0, video_port, input_port).await;
+        // 2. Maintain Extra Sessions with strict device isolation
+        let mut gone_extras = Vec::new();
+        for (hw_id, sess) in extras.iter_mut() {
+            if let Some(best_dev) = physical_devices.get(hw_id) {
+                if best_dev.serial != sess.active_serial {
+                    info!(
+                        "Seamless handoff: Slot {} switched transport from {} ({}) to {} ({}) without display teardown",
+                        sess.instance + 1,
+                        sess.transport.label(), sess.active_serial,
+                        best_dev.transport.label(), best_dev.serial
+                    );
+                    if !is_fake_serial(&sess.active_serial) {
+                        teardown_adb_forwarding(&sess.active_serial, sess.video_port, sess.input_port).await;
                     }
-                    let _ = tablet_tx.send(false);
-                    let _ = serial_tx.send(None);
-                    slot_0_serial = None;
+                    if !is_fake_serial(&best_dev.serial) {
+                        on_tablet_connected(&best_dev.serial, sess.video_port, sess.input_port, auto_launch, token.as_deref()).await;
+                        if best_dev.transport == Transport::Usb {
+                            auto_provision_wifi(&best_dev.serial).await;
+                        }
+                    }
+                    sess.active_serial = best_dev.serial.clone();
+                    sess.transport = best_dev.transport;
+                    announce_transport(&best_dev.serial);
                 }
-            } else if transport_of(s0) == Transport::Network {
-                // Device currently running over Wi-Fi. Check if a USB device has connected to restore lower latency
-                if let Some(usb) = devices.iter().find(|d| transport_of(d) == Transport::Usb && !is_fake_serial(d)) {
-                    info!("Seamless handoff: USB cable reconnected ({}) — switching from Wi-Fi ({}) to USB for lower latency", usb, s0);
-                    teardown_adb_forwarding(s0, video_port, input_port).await;
-                    on_tablet_connected(usb, video_port, input_port, auto_launch, token.as_deref()).await;
-                    slot_0_serial = Some(usb.clone());
-                    let _ = serial_tx.send(Some(usb.clone()));
-                    announce_transport(usb);
-                }
+            } else {
+                gone_extras.push(hw_id.clone());
             }
         }
 
-        let gone_extras: Vec<String> = extras.keys().filter(|k| !devices.contains(k)).cloned().collect();
-        for serial in gone_extras {
-            if let Some(sess) = extras.remove(&serial) {
-                info!("Device on Slot {} disconnected ({})", sess.instance + 1, serial);
-                if !is_fake_serial(&serial) {
-                    teardown_adb_forwarding(&serial, sess.video_port, sess.input_port).await;
+        for hw_id in gone_extras {
+            if let Some(sess) = extras.remove(&hw_id) {
+                info!("Device on Slot {} disconnected ({})", sess.instance + 1, sess.active_serial);
+                if !is_fake_serial(&sess.active_serial) {
+                    teardown_adb_forwarding(&sess.active_serial, sess.video_port, sess.input_port).await;
                 }
-                sess.stop().await;
+                sess.stop_background();
             }
         }
 
-        // 2. Assign newly attached devices to free slots without disturbing active sessions
-        for serial in &devices {
-            if slot_0_serial.as_ref() == Some(serial) || extras.contains_key(serial) {
-                // Device already has an active, running slot — leave it alone
+        // 3. Assign newly attached devices to free slots without disturbing active sessions
+        for (hw_id, dev) in &physical_devices {
+            if slot_0_hw.as_ref() == Some(hw_id) || extras.contains_key(hw_id) {
+                // Device already has an active session — leave it alone
                 continue;
             }
 
-            if slot_0_serial.is_none() {
+            if slot_0_hw.is_none() {
                 info!(
                     "Device connected on Slot 1 over {} ({})",
-                    transport_of(serial).label(),
-                    serial
+                    dev.transport.label(),
+                    dev.serial
                 );
-                announce_transport(serial);
-                let _ = serial_tx.send(Some(serial.clone()));
-                apply_tablet_profile(serial, &settings_tx).await;
-                if !is_fake_serial(serial) {
-                    on_tablet_connected(serial, video_port, input_port, auto_launch, token.as_deref()).await;
-                    if transport_of(serial) == Transport::Usb {
-                        auto_provision_wifi(serial).await;
+                announce_transport(&dev.serial);
+                let _ = serial_tx.send(Some(dev.serial.clone()));
+                apply_tablet_profile(&dev.serial, &settings_tx).await;
+                if !is_fake_serial(&dev.serial) {
+                    on_tablet_connected(&dev.serial, video_port, input_port, auto_launch, token.as_deref()).await;
+                    if dev.transport == Transport::Usb {
+                        auto_provision_wifi(&dev.serial).await;
                     }
                 }
                 let _ = tablet_tx.send(true);
-                slot_0_serial = Some(serial.clone());
-                relaunches = 0;
-                relaunch_wait = std::time::Duration::from_secs(5);
+                slot_0_hw = Some(hw_id.clone());
+                slot_0_active_serial = dev.serial.clone();
+                slot_0_transport = dev.transport;
+                slot_0_relaunches = 0;
+                slot_0_relaunch_wait = std::time::Duration::from_secs(5);
             } else if extra.max_tablets > 1 {
                 let used: Vec<u32> = extras.values().map(|s| s.instance).collect();
                 let Some(instance) = (1..extra.max_tablets).find(|i| !used.contains(i)) else {
-                    warn!("Device {} attached but all {} slots are taken", serial, extra.max_tablets);
+                    warn!("Device {} attached but all {} slots are taken", dev.serial, extra.max_tablets);
                     continue;
                 };
-                info!("Device connected on Slot {} over {} ({})", instance + 1, transport_of(serial).label(), serial);
-                let Some(sess) = spawn_extra_session(&extra, instance, serial) else {
+                info!("Device connected on Slot {} over {} ({})", instance + 1, dev.transport.label(), dev.serial);
+                let Some(sess) = spawn_extra_session(&extra, instance, &dev.serial, hw_id.clone(), dev.transport) else {
                     continue;
                 };
-                apply_tablet_profile(serial, &sess.settings_tx).await;
+                apply_tablet_profile(&dev.serial, &sess.settings_tx).await;
                 {
                     let mut rx = sess.settings_tx.subscribe();
-                    let serial_for_save = serial.clone();
+                    let serial_for_save = dev.serial.clone();
                     tokio::spawn(async move {
                         while rx.changed().await.is_ok() {
                             let s = rx.borrow().clone();
@@ -1187,22 +1338,17 @@ async fn adb_monitor(
                         }
                     });
                 }
-                let is_fake = is_fake_serial(serial);
-                if !is_fake {
-                    on_tablet_connected(serial, sess.video_port, sess.input_port, auto_launch, token.as_deref()).await;
-                    if transport_of(serial) == Transport::Usb {
-                        auto_provision_wifi(serial).await;
+                if !is_fake_serial(&dev.serial) {
+                    on_tablet_connected(&dev.serial, sess.video_port, sess.input_port, auto_launch, token.as_deref()).await;
+                    if dev.transport == Transport::Usb {
+                        auto_provision_wifi(&dev.serial).await;
                     }
                 }
                 let _ = sess.tablet_tx.send(true);
-                extras.insert(serial.clone(), sess);
+                extras.insert(hw_id.clone(), sess);
             }
         }
 
-        // Poll every two seconds, but wake at once if a client turned up
-        // without the token: the app was started by hand, and launching it
-        // again over adb is how it gets one. Rate-limited so a misbehaving
-        // client cannot make us hammer adb.
         let extra_relaunch = async {
             let notifies: Vec<_> = extras.values().map(|s| s.relaunch.clone()).collect();
             if notifies.is_empty() {
@@ -1211,6 +1357,7 @@ async fn adb_monitor(
             let futs = notifies.iter().map(|n| Box::pin(n.notified()));
             futures_util::future::select_all(futs).await;
         };
+
         tokio::select! {
             _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {
                 polls_since_check += 1;
@@ -1218,68 +1365,94 @@ async fn adb_monitor(
                     continue;
                 }
                 polls_since_check = 0;
-                // Nothing attached, but this tablet has been set up for
-                // Wi-Fi: try to get it back. adb answers instantly when the
-                // tablet is not reachable, so this costs nothing while it is
-                // off or out of range.
-                if slot_0_serial.is_none() && !wifi_address.is_empty() {
-                    let out = tokio::process::Command::new("adb")
-                        .args(["connect", &wifi_address])
-                        .output()
-                        .await;
-                    if let Ok(o) = out {
-                        let said = String::from_utf8_lossy(&o.stdout);
-                        if said.contains("connected") && !wifi_announced {
-                            info!("Reconnected to the tablet over Wi-Fi ({})", wifi_address);
-                            wifi_announced = true;
+
+                // A. Background Wi-Fi Reconnection Watchdog: ensure all configured devices connect
+                let file_cfg = config::FileConfig::load();
+                let mut targets = Vec::new();
+                if !file_cfg.wifi_address.is_empty() {
+                    targets.push(file_cfg.wifi_address.clone());
+                }
+                if !wifi_address.is_empty() && !targets.contains(&wifi_address) {
+                    targets.push(wifi_address.clone());
+                }
+                for (_k, p) in &file_cfg.tablets {
+                    if let Some(ref w) = p.wifi_address {
+                        if !targets.contains(w) {
+                            targets.push(w.clone());
                         }
                     }
                 }
-                let Some(serial) = slot_0_serial.as_deref() else { continue };
-                if !auto_launch || is_fake_serial(serial) {
-                    continue;
+                for target in targets {
+                    let already_connected = all_devices.iter().any(|d| d.serial == target);
+                    if !already_connected {
+                        tokio::spawn(async move {
+                            let _ = tokio::process::Command::new("adb")
+                                .args(["connect", &target])
+                                .output()
+                                .await;
+                        });
+                    }
                 }
-                match app_running(serial).await {
-                    Some(true) => {
-                        // Seen alive: the next disappearance starts the
-                        // backoff from the beginning again.
-                        relaunch_wait = std::time::Duration::from_secs(5);
+
+                // B. App Running Watchdog for Slot 0
+                if auto_launch && !slot_0_active_serial.is_empty() && !is_fake_serial(&slot_0_active_serial) {
+                    match app_running(&slot_0_active_serial).await {
+                        Some(true) => {
+                            slot_0_relaunch_wait = std::time::Duration::from_secs(5);
+                        }
+                        Some(false) if slot_0_last_relaunch.elapsed() >= slot_0_relaunch_wait => {
+                            slot_0_last_relaunch = std::time::Instant::now();
+                            info!("UScreen app not running on Slot 1 ({}) — launching it", slot_0_active_serial);
+                            launch_app(&slot_0_active_serial, token.as_deref(), video_port, input_port).await;
+                            slot_0_relaunch_wait = (slot_0_relaunch_wait * 2).min(RELAUNCH_WAIT_MAX);
+                        }
+                        _ => {}
                     }
-                    Some(false) if last_relaunch.elapsed() >= relaunch_wait => {
-                        last_relaunch = std::time::Instant::now();
-                        info!(
-                            "The app is not running on the tablet — launching it again (next try in {:?} if it does not stay up)",
-                            (relaunch_wait * 2).min(RELAUNCH_WAIT_MAX)
-                        );
-                        launch_app(serial, token.as_deref(), video_port, input_port).await;
-                        relaunch_wait = (relaunch_wait * 2).min(RELAUNCH_WAIT_MAX);
+                }
+
+                // C. App Running Watchdog for ALL Extra Sessions
+                if auto_launch {
+                    for sess in extras.values_mut() {
+                        if is_fake_serial(&sess.active_serial) { continue; }
+                        match app_running(&sess.active_serial).await {
+                            Some(true) => {
+                                sess.relaunch_wait = std::time::Duration::from_secs(5);
+                            }
+                            Some(false) if sess.last_relaunch.elapsed() >= sess.relaunch_wait => {
+                                sess.last_relaunch = std::time::Instant::now();
+                                info!("UScreen app not running on Slot {} ({}) — launching it", sess.instance + 1, sess.active_serial);
+                                launch_app(&sess.active_serial, token.as_deref(), sess.video_port, sess.input_port).await;
+                                sess.relaunch_wait = (sess.relaunch_wait * 2).min(RELAUNCH_WAIT_MAX);
+                            }
+                            _ => {}
+                        }
                     }
-                    _ => {}
                 }
             }
             _ = relaunch.notified() => {
-                if let Some(serial) = slot_0_serial.as_deref() {
-                    if last_relaunch.elapsed() >= relaunch_wait {
-                        last_relaunch = std::time::Instant::now();
-                        relaunches += 1;
-                        if relaunches == 3 {
-                            warn!(
-                                "A client keeps connecting without a valid token. Update the \
-                                 UScreen app on the tablet (1.1.0 or newer); the token will be \
-                                 delivered again, less and less often, until it works."
-                            );
+                if !slot_0_active_serial.is_empty() {
+                    if slot_0_last_relaunch.elapsed() >= slot_0_relaunch_wait {
+                        slot_0_last_relaunch = std::time::Instant::now();
+                        slot_0_relaunches += 1;
+                        if slot_0_relaunches == 3 {
+                            warn!("A client keeps connecting without a valid token. Update the UScreen app on the tablet (1.1.0 or newer).");
                         }
-                        info!("Delivering the session token to the app (attempt {}, next in {:?})", relaunches, relaunch_wait.min(RELAUNCH_WAIT_MAX));
-                        launch_app(serial, token.as_deref(), video_port, input_port).await;
-                        relaunch_wait = (relaunch_wait * 2).min(RELAUNCH_WAIT_MAX);
+                        info!("Delivering session token to Slot 1 app (attempt {}, next in {:?})", slot_0_relaunches, slot_0_relaunch_wait.min(RELAUNCH_WAIT_MAX));
+                        launch_app(&slot_0_active_serial, token.as_deref(), video_port, input_port).await;
+                        slot_0_relaunch_wait = (slot_0_relaunch_wait * 2).min(RELAUNCH_WAIT_MAX);
                     }
                 }
             }
             _ = extra_relaunch => {
-                // Deliver the token to every extra tablet; cheap and rare.
-                for (serial, sess) in extras.iter() {
-                    if is_fake_serial(serial) { continue; }
-                    launch_app(serial, token.as_deref(), sess.video_port, sess.input_port).await;
+                for sess in extras.values_mut() {
+                    if is_fake_serial(&sess.active_serial) { continue; }
+                    if sess.last_relaunch.elapsed() >= sess.relaunch_wait {
+                        sess.last_relaunch = std::time::Instant::now();
+                        sess.relaunches += 1;
+                        info!("Delivering session token to Slot {} app ({})", sess.instance + 1, sess.active_serial);
+                        launch_app(&sess.active_serial, token.as_deref(), sess.video_port, sess.input_port).await;
+                        sess.relaunch_wait = (sess.relaunch_wait * 2).min(RELAUNCH_WAIT_MAX);
+                    }
                 }
             }
         }
@@ -1398,6 +1571,19 @@ async fn auto_provision_wifi(serial: &str) {
     }
     let s = serial.to_string();
     tokio::spawn(async move {
+        // If Wi-Fi is already known for this device, avoid running `adb tcpip 5555`
+        // which resets Android's adbd and causes a disruptive USB bus re-enumeration.
+        let cfg = config::FileConfig::load();
+        if let Some(profile) = cfg.tablets.get(&s) {
+            if let Some(ref addr) = profile.wifi_address {
+                let _ = tokio::process::Command::new("adb")
+                    .args(["connect", addr])
+                    .output()
+                    .await;
+                return;
+            }
+        }
+
         let out = tokio::process::Command::new("adb")
             .args(["-s", &s, "tcpip", "5555"])
             .output()
@@ -1410,11 +1596,8 @@ async fn auto_provision_wifi(serial: &str) {
                 info!("Discovered Wi-Fi address for device {}: {}", s, addr);
                 let mut cfg = config::FileConfig::load();
                 let profile = cfg.tablets.entry(s.clone()).or_default();
-                if profile.wifi_address.is_none() {
+                if profile.wifi_address.as_ref() != Some(&addr) {
                     profile.wifi_address = Some(addr.clone());
-                    if cfg.wifi_address.is_empty() {
-                        cfg.wifi_address = addr.clone();
-                    }
                     let _ = cfg.save();
                 }
                 // Pre-connect in background so Wi-Fi transport is hot and ready for handoff
@@ -1756,10 +1939,14 @@ async fn setup_adb_forwarding(serial: &str, video_port: u16, input_port: u16) ->
     // Forward unique ports directly
     for port in [video_port, input_port] {
         let arg = format!("tcp:{}", port);
-        let r = tokio::process::Command::new("adb")
-            .args(["-s", serial, "reverse", &arg, &arg])
-            .output()
-            .await?;
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::process::Command::new("adb")
+                .args(["-s", serial, "reverse", &arg, &arg])
+                .output(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("adb reverse {} timed out", arg))??;
         if !r.status.success() {
             anyhow::bail!(
                 "adb reverse {} failed: {}",
@@ -1768,25 +1955,37 @@ async fn setup_adb_forwarding(serial: &str, video_port: u16, input_port: u16) ->
             );
         }
     }
-    // Also map device localhost 8890/8891 to this device's host ports for fallback
-    let _ = tokio::process::Command::new("adb")
-        .args(["-s", serial, "reverse", "tcp:8890", &format!("tcp:{}", video_port)])
-        .output()
-        .await;
-    let _ = tokio::process::Command::new("adb")
-        .args(["-s", serial, "reverse", "tcp:8891", &format!("tcp:{}", input_port)])
-        .output()
-        .await;
+    // Only map fallback 8890/8891 for slot 0 to avoid multi-device port cross-talk
+    if video_port == 8890 {
+        let _ = tokio::process::Command::new("adb")
+            .args(["-s", serial, "reverse", "tcp:8890", "tcp:8890"])
+            .output()
+            .await;
+        let _ = tokio::process::Command::new("adb")
+            .args(["-s", serial, "reverse", "tcp:8891", "tcp:8891"])
+            .output()
+            .await;
+    }
     Ok(())
 }
 
 async fn teardown_adb_forwarding(serial: &str, video_port: u16, input_port: u16) {
-    for port in [video_port, input_port, 8890, 8891] {
+    let mut ports_to_remove = vec![video_port, input_port];
+    if video_port == 8890 {
+        ports_to_remove.push(8890);
+        ports_to_remove.push(8891);
+    }
+    ports_to_remove.sort_unstable();
+    ports_to_remove.dedup();
+    for port in ports_to_remove {
         let arg = format!("tcp:{}", port);
-        let _ = tokio::process::Command::new("adb")
-            .args(["-s", serial, "reverse", "--remove", &arg])
-            .output()
-            .await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::process::Command::new("adb")
+                .args(["-s", serial, "reverse", "--remove", &arg])
+                .output(),
+        )
+        .await;
     }
 }
 
@@ -1895,5 +2094,46 @@ mod tests {
         assert!(!is_network_serial("emulator-5554"));
         assert_eq!(transport_of("R52WA0A0KED"), Transport::Usb);
         assert_eq!(transport_of("adb-X-y._adb-tls-connect._tcp"), Transport::Network);
+    }
+
+    #[test]
+    fn physical_device_deduplication_prefers_usb() {
+        let dev1 = DiscoveredDevice {
+            serial: "192.168.1.74:5555".to_string(),
+            state: "device".to_string(),
+            transport: Transport::Network,
+            hw_id: "RZCX809Y0FT".to_string(),
+        };
+        let dev2 = DiscoveredDevice {
+            serial: "RZCX809Y0FT".to_string(),
+            state: "device".to_string(),
+            transport: Transport::Usb,
+            hw_id: "RZCX809Y0FT".to_string(),
+        };
+        let dev3 = DiscoveredDevice {
+            serial: "R52X708AEHK".to_string(),
+            state: "device".to_string(),
+            transport: Transport::Usb,
+            hw_id: "R52X708AEHK".to_string(),
+        };
+
+        let mut map: std::collections::HashMap<String, &DiscoveredDevice> = std::collections::HashMap::new();
+        for dev in &[&dev1, &dev2, &dev3] {
+            map.entry(dev.hw_id.clone())
+                .and_modify(|existing| {
+                    if existing.transport != Transport::Usb && dev.transport == Transport::Usb {
+                        *existing = dev;
+                    }
+                })
+                .or_insert(dev);
+        }
+
+        // Must collapse to 2 distinct physical devices
+        assert_eq!(map.len(), 2);
+        // RZCX809Y0FT must choose the USB endpoint over Network
+        assert_eq!(map.get("RZCX809Y0FT").unwrap().serial, "RZCX809Y0FT");
+        assert_eq!(map.get("RZCX809Y0FT").unwrap().transport, Transport::Usb);
+        // R52X708AEHK must be intact
+        assert_eq!(map.get("R52X708AEHK").unwrap().serial, "R52X708AEHK");
     }
 }

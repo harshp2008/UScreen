@@ -1131,8 +1131,11 @@ impl CaptureManager {
                         self.config.width_mm, self.config.height_mm,
                         s.width, s.height, s.fps, s.width_mm, s.height_mm
                     );
+                    if let Some(mut e) = self.encoder_child.take() {
+                        Self::terminate(&mut e, "ffmpeg").await;
+                    }
                     if let Some(mut h) = self.helper_child.take() {
-                        let _ = h.start_kill();
+                        Self::terminate(&mut h, "evdi_helper").await;
                     }
                     // Give the compositor a moment to process the unplug
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1161,12 +1164,12 @@ impl CaptureManager {
             // disappear exactly like a cable being plugged in and out.
             // If keep_alive is set, the helper and display are preserved.
             if !*display_rx.borrow() && !self.config.keep_alive {
-                if let Some(mut h) = self.helper_child.take() {
-                    info!("No tablet is a screen — disconnecting the virtual display");
-                    let _ = h.start_kill();
-                }
+                info!("No tablet is a screen — disconnecting the virtual display");
                 if let Some(mut e) = self.encoder_child.take() {
-                    let _ = e.start_kill();
+                    Self::terminate(&mut e, "ffmpeg").await;
+                }
+                if let Some(mut h) = self.helper_child.take() {
+                    Self::terminate(&mut h, "evdi_helper").await;
                 }
                 encoder_mode = None;
                 tokio::select! {
@@ -1243,8 +1246,11 @@ impl CaptureManager {
             if self.encoder_child.is_none() {
                 if let Err(e) = self.start_encoder().await {
                     error!("Failed to start encoder: {}. Retrying in {}ms...", e, backoff_ms);
+                    if let Some(mut e) = self.encoder_child.take() {
+                        Self::terminate(&mut e, "ffmpeg").await;
+                    }
                     if let Some(mut h) = self.helper_child.take() {
-                        let _ = h.start_kill();
+                        Self::terminate(&mut h, "evdi_helper").await;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     backoff_ms = (backoff_ms * 2).min(30_000);
@@ -1464,13 +1470,13 @@ impl CaptureManager {
             // Clean up and retry. On a settings or mode change, keep the helper
             // alive (an fps/resolution change is handled at the top of the loop)
             // so the virtual display doesn't flicker off.
+            if let Some(mut e) = self.encoder_child.take() {
+                Self::terminate(&mut e, "ffmpeg").await;
+            }
             if !settings_changed && !mode_changed {
                 if let Some(mut h) = self.helper_child.take() {
-                    let _ = h.start_kill();
+                    Self::terminate(&mut h, "evdi_helper").await;
                 }
-            }
-            if let Some(mut e) = self.encoder_child.take() {
-                let _ = e.start_kill();
             }
             encoder_mode = None;
             // Reset codec config so it gets re-extracted on restart
@@ -1630,11 +1636,15 @@ impl CaptureManager {
         if let Some(task) = self.helper_stdout_task.take() {
             task.abort();
         }
-        if let Some(mut child) = self.helper_child.take() {
-            let _ = child.start_kill();
+        if let Some(child) = self.encoder_child.as_mut() {
+            if let Some(pid) = child.id() {
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+            }
         }
-        if let Some(mut child) = self.encoder_child.take() {
-            let _ = child.start_kill();
+        if let Some(child) = self.helper_child.as_mut() {
+            if let Some(pid) = child.id() {
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+            }
         }
     }
 
